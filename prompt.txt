@@ -1,0 +1,216 @@
+You are working in a robotics motion planning repository that contains PyRoNot, a modular robotics kinematics library with CUDA-accelerated kernels exposed to JAX via the JAX Foreign Function Interface (FFI).
+
+Your task is to implement a GPU-accelerated parallel RRTC motion planner (pRRTC) that integrates with PyRoNot’s existing CUDA backend.
+
+System Context
+PyRoNot
+
+PyRoNot provides high-performance robotics primitives implemented in CUDA and accessible through JAX FFI:
+
+Available CUDA kernels:
+
+Forward kinematics
+Collision checking for configurations
+Robot state representations
+
+These kernels are already implemented and must be reused rather than reimplemented.
+
+pRRTC
+
+pRRTC is a parallel version of the RRTC algorithm from Vector Accelerated Motion Planning.
+It builds trees in configuration space to connect a start configuration to a goal configuration.
+
+The original pRRTC CUDA implementation uses:
+
+massive GPU parallelism
+warp-level primitives
+block-level reductions
+parallel nearest neighbor search
+parallel tree expansion
+
+The algorithm repeatedly performs:
+
+Sample random configuration
+Find nearest node in the tree
+Extend the tree toward the sample
+Validate via collision checking
+Insert new node into tree
+Check if goal reached
+Implementation Goal
+
+Implement pRRTC CUDA kernels that integrate with PyRoNot’s JAX FFI backend.
+
+JAX will:
+
+Load motion planning problems (MBM format)
+Provide:
+start configuration
+goal configuration
+Call a single JAX primitive that executes the pRRTC planner through CUDA.
+
+The CUDA planner will perform the iterative planning loop internally.
+
+Required CUDA Kernels
+
+Design modular kernels that separate core algorithm components.
+
+1. Nearest Neighbor Kernel
+
+Compute the nearest node in the tree to a candidate configuration.
+
+Requirements:
+
+Parallel reduction across tree nodes
+Warp-level reductions preferred
+Avoid global synchronization where possible
+Should support trees containing thousands to millions of nodes
+
+Output:
+
+nearest_node_index
+nearest_distance
+2. Tree Extension Kernel
+
+Extend the tree from the nearest node toward the sampled configuration.
+
+Steps:
+
+Compute direction vector
+Apply step-size limit
+Generate candidate configuration
+Validate configuration using PyRoNot collision kernel
+Insert node if valid
+
+Outputs:
+
+new_node
+parent_index
+valid_flag
+3. Planning Iteration Kernel
+
+Perform a single iteration of the RRTC algorithm.
+
+Steps:
+
+sample configuration
+nearest neighbor
+extend
+collision check
+insert node
+goal check
+
+Parallelization strategies may include:
+
+parallel samples per iteration
+parallel extensions
+speculative node insertions
+CUDA Performance Requirements
+
+Use GPU parallelism effectively:
+
+Parallelization
+
+Use:
+
+warp-level reductions
+block-wide reductions
+shared memory where appropriate
+Memory Layout
+
+Tree nodes should use Structure-of-Arrays layout:
+
+float* tree_configs
+int* parent_indices
+
+to ensure coalesced memory access.
+
+CUDA Graphs
+
+Planning involves many repeated kernel launches.
+
+Use CUDA Graph capture to reduce launch overhead:
+
+capture planning iteration graph
+replay graph until termination
+JAX Integration
+
+Expose the planner through JAX FFI as a single primitive.
+
+Example API:
+
+result = prrtc_plan(
+    start_config,
+    goal_config,
+    robot_model,
+    max_iterations,
+)
+
+Implementation details:
+
+CUDA kernels compiled as shared library
+JAX calls planner through FFI
+Planner executes fully on GPU
+Batched Planning
+Implement all your work within cuda-rrtc
+
+The design must support JAX auto-vectorization.
+
+JAX users should be able to run:
+
+jax.vmap(prrtc_plan)(starts, goals)
+
+Therefore:
+
+CUDA planner must support batched problems
+Avoid global state
+Use batch dimension where appropriate
+Constraints
+
+Do NOT:
+
+reimplement PyRoNot kinematics
+reimplement collision checking
+modify any code in PyRoNot
+modify any code in pRRTC
+call any kernels from pRRTC (only use it as reference to rewrite)
+Instead call existing kernels.
+
+Focus only on:
+
+nearest neighbor
+tree extension
+planner orchestration
+Expected Repository Additions
+
+Implement:
+
+cuda/
+    prrtc_nearest_neighbor.cu
+    prrtc_extend.cu
+    prrtc_iteration.cu
+    prrtc_planner.cu
+
+ffi/
+    prrtc_ffi.cc
+
+jax/
+    prrtc.py
+Success Criteria
+
+The implementation should:
+
+run entirely on GPU
+integrate with JAX FFI
+support batched planning via vmap
+reuse PyRoNot CUDA primitives
+minimize kernel launch overhead via CUDA Graphs
+scale to large configuration trees
+Implementation Style
+
+Prefer:
+
+deterministic kernels
+modular design
+minimal host-device synchronization
+warp-efficient reductions
+clear separation between planning logic and robotics primitives
