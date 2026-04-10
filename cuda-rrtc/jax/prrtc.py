@@ -85,7 +85,7 @@ def prrtc_plan(
     goal_configs: Float[Array, "num_goals dim"],
     max_iterations: int = 10000,
     step_size: float = 0.5,
-    num_new_samples: int = 64,
+    num_new_samples: int = 600,
     balance_mode: int = 1,
     tree_ratio: float = 0.5,
     dynamic_domain: bool = True,
@@ -115,7 +115,11 @@ def prrtc_plan(
         min_vals: Minimum configuration values (optional, defaults to -pi).
         max_vals: Maximum configuration values (optional, defaults to pi).
         collision_context: Pyronot collision tensors. Collision-aware planning
-            is enabled by default and requires this context.
+            is enabled by default and requires this context. World geometry keys
+            are all optional (default empty): ``world_spheres`` [Ms,4],
+            ``world_capsules`` [Mc,7], ``world_boxes`` [Mb,15],
+            ``world_halfspaces`` [Mh,6]. At least one must be non-empty for
+            collision checking to be active.
         allow_unsafe_no_collision: If True, disables default collision-context
             requirement and runs geometric-only planning.
 
@@ -168,6 +172,10 @@ def prrtc_plan(
     min_vals = jnp.asarray(min_vals, dtype=jnp.float32)
     max_vals = jnp.asarray(max_vals, dtype=jnp.float32)
 
+    step_size = float(step_size)
+    if step_size <= 0.0:
+        raise ValueError("step_size must be > 0")
+
     # Compute max nodes based on iterations and batch size
     max_nodes = max_iterations + num_goals + 1000
 
@@ -197,6 +205,9 @@ def prrtc_plan(
     sphere_local = jnp.zeros((0, 3), dtype=jnp.float32)
     sphere_radius = jnp.zeros((0,), dtype=jnp.float32)
     world_spheres = jnp.zeros((0, 4), dtype=jnp.float32)
+    world_capsules = jnp.zeros((0, 7), dtype=jnp.float32)
+    world_boxes = jnp.zeros((0, 15), dtype=jnp.float32)
+    world_halfspaces = jnp.zeros((0, 6), dtype=jnp.float32)
     self_pairs = jnp.zeros((0, 2), dtype=jnp.int32)
 
     required_keys = (
@@ -211,7 +222,6 @@ def prrtc_plan(
         "sphere_link_idx",
         "sphere_local",
         "sphere_radius",
-        "world_spheres",
     )
 
     if collision_context is None and not allow_unsafe_no_collision:
@@ -236,7 +246,10 @@ def prrtc_plan(
         sphere_link_idx = jnp.asarray(collision_context["sphere_link_idx"], dtype=jnp.int32)
         sphere_local = jnp.asarray(collision_context["sphere_local"], dtype=jnp.float32)
         sphere_radius = jnp.asarray(collision_context["sphere_radius"], dtype=jnp.float32)
-        world_spheres = jnp.asarray(collision_context["world_spheres"], dtype=jnp.float32)
+        world_spheres = jnp.asarray(collision_context["world_spheres"], dtype=jnp.float32) if "world_spheres" in collision_context else world_spheres
+        world_capsules = jnp.asarray(collision_context["world_capsules"], dtype=jnp.float32) if "world_capsules" in collision_context else world_capsules
+        world_boxes = jnp.asarray(collision_context["world_boxes"], dtype=jnp.float32) if "world_boxes" in collision_context else world_boxes
+        world_halfspaces = jnp.asarray(collision_context["world_halfspaces"], dtype=jnp.float32) if "world_halfspaces" in collision_context else world_halfspaces
         if "self_pairs" in collision_context:
             self_pairs = jnp.asarray(collision_context["self_pairs"], dtype=jnp.int32)
 
@@ -261,6 +274,9 @@ def prrtc_plan(
         sphere_local,
         sphere_radius,
         world_spheres,
+        world_capsules,
+        world_boxes,
+        world_halfspaces,
         self_pairs,
         max_iterations=np.int32(max_iterations),
         step_size=np.float32(step_size),

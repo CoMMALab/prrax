@@ -82,31 +82,81 @@ def _sphere_geom_to_array(sphere_geom) -> np.ndarray:
     return np.concatenate([centers, radii], axis=-1)
 
 
-def world_obstacles_to_spheres(obstacles, capsule_segments: int = 5) -> np.ndarray:
-    """Approximate world obstacles as spheres for CUDA pRRTC collision context."""
-    spheres = []
-    skipped_halfspaces = 0
+def world_obstacles_to_exact(obstacles) -> dict[str, np.ndarray]:
+    """Extract world obstacles in their native geometry types for CUDA pRRTC.
+
+    The CUDA kernel supports sphere, capsule, box, and halfspace primitives
+    natively.  Converting everything to spheres (the old approach) inflates
+    obstacle volumes and makes collision checking overly conservative in
+    narrow passages.
+    """
+    spheres: list[np.ndarray] = []
+    capsules: list[np.ndarray] = []
+    boxes: list[np.ndarray] = []
+    halfspaces: list[np.ndarray] = []
+
     for obs in obstacles or []:
         if isinstance(obs, Sphere):
             spheres.append(_sphere_geom_to_array(obs))
         elif isinstance(obs, Capsule):
-            spheres.append(_sphere_geom_to_array(obs.decompose_to_spheres(capsule_segments)))
+            # Capsule: [x1, y1, z1, x2, y2, z2, radius]
+            axes = obs.get_batch_axes()
+            if len(axes) == 0:
+                obs = obs.broadcast_to((1,))
+            elif len(axes) > 1:
+                obs = obs.reshape((-1,))
+            centers = np.asarray(obs.pose.translation(), dtype=np.float32)
+            axis_dir = np.asarray(obs.axis, dtype=np.float32)
+            half_h = np.asarray(obs.height, dtype=np.float32).reshape(-1, 1) / 2.0
+            radii = np.asarray(obs.radius, dtype=np.float32).reshape(-1, 1)
+            p1 = centers - axis_dir * half_h
+            p2 = centers + axis_dir * half_h
+            capsules.append(
+                np.concatenate([p1, p2, radii], axis=-1).astype(np.float32)
+            )
         elif isinstance(obs, Box):
-            spheres.append(_sphere_geom_to_array(Sphere.from_trimesh(obs.to_trimesh())))
+            # Box: [cx, cy, cz, a1x..a1z, a2x..a2z, a3x..a3z, hl1, hl2, hl3]
+            axes = obs.get_batch_axes()
+            if len(axes) == 0:
+                obs = obs.broadcast_to((1,))
+            elif len(axes) > 1:
+                obs = obs.reshape((-1,))
+            centers = np.asarray(obs.pose.translation(), dtype=np.float32)
+            rot = np.asarray(obs.pose.rotation().as_matrix(), dtype=np.float32)
+            hl = np.asarray(obs.half_lengths, dtype=np.float32)
+            a1 = rot[..., :, 0]
+            a2 = rot[..., :, 1]
+            a3 = rot[..., :, 2]
+            boxes.append(
+                np.concatenate([centers, a1, a2, a3, hl], axis=-1).astype(np.float32)
+            )
         elif isinstance(obs, HalfSpace):
-            # Half-spaces are unbounded and not representable in sphere-only context.
-            skipped_halfspaces += 1
+            # HalfSpace: [nx, ny, nz, px, py, pz]
+            axes = obs.get_batch_axes()
+            if len(axes) == 0:
+                obs = obs.broadcast_to((1,))
+            elif len(axes) > 1:
+                obs = obs.reshape((-1,))
+            normals = np.asarray(obs.normal, dtype=np.float32)
+            points = np.asarray(obs.pose.translation(), dtype=np.float32)
+            halfspaces.append(
+                np.concatenate([normals, points], axis=-1).astype(np.float32)
+            )
         elif hasattr(obs, "to_trimesh"):
+            # Fallback: approximate unknown geometry as spheres
             spheres.append(_sphere_geom_to_array(Sphere.from_trimesh(obs.to_trimesh())))
 
-    if skipped_halfspaces > 0:
-        print(
-            f"  Note: skipped {skipped_halfspaces} half-space obstacle(s) for pRRTC sphere context"
-        )
+    def _concat_or_empty(arrs, cols):
+        if arrs:
+            return np.concatenate(arrs, axis=0).astype(np.float32)
+        return np.zeros((0, cols), dtype=np.float32)
 
-    if not spheres:
-        return np.zeros((0, 4), dtype=np.float32)
-    return np.concatenate(spheres, axis=0).astype(np.float32)
+    return {
+        "world_spheres": _concat_or_empty(spheres, 4),
+        "world_capsules": _concat_or_empty(capsules, 7),
+        "world_boxes": _concat_or_empty(boxes, 15),
+        "world_halfspaces": _concat_or_empty(halfspaces, 6),
+    }
 
 
 def build_prrtc_collision_context(robot, robot_coll, world_obstacles):
@@ -126,9 +176,19 @@ def build_prrtc_collision_context(robot, robot_coll, world_obstacles):
     valid = sphere_radius_full > 0.0
 
     link_ids = np.broadcast_to(np.arange(n_links, dtype=np.int32)[:, None], (n_links, n_spheres_per_link))
-    sphere_link_idx = link_ids[valid]
+    sphere_link_idx_raw = link_ids[valid]
     sphere_local = sphere_local_full[valid]
     sphere_radius = sphere_radius_full[valid]
+
+    # The CUDA FK produces T_world indexed by JOINT (n_joints entries), but
+    # the collision model is indexed by LINK (n_links entries).  For Panda,
+    # n_joints=12 but n_links=13, so link index 12 would read uninitialised
+    # memory.  Remap each sphere's link index to its parent joint index so
+    # the CUDA kernel indexes into T_world correctly.
+    parent_joint_indices = np.asarray(robot.links.parent_joint_indices, dtype=np.int32)
+    sphere_link_idx = parent_joint_indices[sphere_link_idx_raw]
+    # Base-link spheres get parent_joint=-1; the CUDA kernel already skips
+    # negative indices (guard: if link_idx < 0 ... continue).
 
     flat_index = np.full((n_links, n_spheres_per_link), -1, dtype=np.int32)
     flat_index[valid] = np.arange(sphere_radius.shape[0], dtype=np.int32)
@@ -146,7 +206,7 @@ def build_prrtc_collision_context(robot, robot_coll, world_obstacles):
         pairs.append(np.stack(np.meshgrid(a, b, indexing="ij"), axis=-1).reshape(-1, 2))
     self_pairs = np.concatenate(pairs, axis=0).astype(np.int32) if pairs else np.zeros((0, 2), dtype=np.int32)
 
-    world_spheres = world_obstacles_to_spheres(world_obstacles)
+    world_geom = world_obstacles_to_exact(world_obstacles)
 
     return {
         "fk_twists": fk_twists,
@@ -160,8 +220,8 @@ def build_prrtc_collision_context(robot, robot_coll, world_obstacles):
         "sphere_link_idx": sphere_link_idx,
         "sphere_local": sphere_local,
         "sphere_radius": sphere_radius,
-        "world_spheres": world_spheres,
         "self_pairs": self_pairs,
+        **world_geom,
     }
 
 
@@ -397,15 +457,21 @@ def main():
     srdf_path = str(RESOURCE_ROOT / "panda" / "panda.srdf")
     robot_coll = RobotCollisionSpherized.from_urdf(urdf, srdf_path=srdf_path)
     n_act = robot.joints.num_actuated_joints
-    print(f"  {n_act} actuated joints")
+    n_joints_total = int(robot.joints.twists.shape[0])
+    n_links_total = int(robot.links.num_links)
+    print(f"  {n_act} actuated joints, {n_joints_total} total joints, {n_links_total} links")
 
     vamp_problem = load_vamp_problem(problem=args.vamp_problem, index=args.vamp_index)
     obstacles = create_collision_environment(vamp_problem) if vamp_problem is not None else []
     collision_context = build_prrtc_collision_context(robot, robot_coll, obstacles)
+    ws = collision_context['world_spheres'].shape[0]
+    wc = collision_context.get('world_capsules', np.empty((0,))).shape[0]
+    wb = collision_context.get('world_boxes', np.empty((0,))).shape[0]
+    wh = collision_context.get('world_halfspaces', np.empty((0,))).shape[0]
     print(
         "  Collision context: "
         f"robot_spheres={collision_context['sphere_radius'].shape[0]}, "
-        f"world_spheres={collision_context['world_spheres'].shape[0]}, "
+        f"world=[spheres={ws}, capsules={wc}, boxes={wb}, halfspaces={wh}], "
         f"self_pairs={collision_context['self_pairs'].shape[0]}"
     )
 
@@ -470,8 +536,11 @@ def main():
                 start_config=start_config,
                 goal_configs=goal_config.reshape(1, -1),
                 max_iterations=5000,
-                step_size=0.25,
+                step_size=1,
                 num_new_samples=64,
+                dynamic_domain=False,
+                min_vals=jnp.array(lo, dtype=jnp.float32),
+                max_vals=jnp.array(hi, dtype=jnp.float32),
                 collision_context=collision_context,
             )
             single_result = result
@@ -531,8 +600,11 @@ def main():
                 start_config=jnp.array(starts_np[i]),
                 goal_configs=jnp.array(goals_np[i]).reshape(1, -1),
                 max_iterations=1000,
-                step_size=0.3,
+                step_size=0.6,
                 num_new_samples=16,
+                dynamic_domain=False,
+                min_vals=jnp.array(lo, dtype=jnp.float32),
+                max_vals=jnp.array(hi, dtype=jnp.float32),
                 collision_context=collision_context,
             )
             results.append(result)
