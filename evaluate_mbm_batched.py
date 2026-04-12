@@ -250,11 +250,16 @@ def evaluate_robot(
     warmup: bool,
     timing_source: str,
     jit_trace: bool,
+    solve_batch_size: int,
     max_problems_per_set: int,
     print_failures: bool,
 ):
     data = load_robot_dataset(robot)
     robot_model, robot_coll, lo, hi = load_robot_models(robot)
+
+    solve_batch_size = int(solve_batch_size)
+    if solve_batch_size <= 0:
+        raise ValueError(f"solve_batch_size must be > 0, got {solve_batch_size}")
 
     problems = data.get("problems", {})
     if not isinstance(problems, dict):
@@ -312,15 +317,15 @@ def evaluate_robot(
                 "dispatching one batched solve with per-problem collision contexts."
             )
 
-        if len(valid_data) > SOLVE_BATCH_CHUNK_SIZE:
-            n_chunks = (len(valid_data) + SOLVE_BATCH_CHUNK_SIZE - 1) // SOLVE_BATCH_CHUNK_SIZE
+        if len(valid_data) > solve_batch_size:
+            n_chunks = (len(valid_data) + solve_batch_size - 1) // solve_batch_size
             print(
                 f"  Splitting {len(valid_data)} valid problems into {n_chunks} chunks "
-                f"of up to {SOLVE_BATCH_CHUNK_SIZE}."
+                f"of up to {solve_batch_size}."
             )
 
-        for chunk_start in range(0, len(valid_data), SOLVE_BATCH_CHUNK_SIZE):
-            chunk_end = min(chunk_start + SOLVE_BATCH_CHUNK_SIZE, len(valid_data))
+        for chunk_start in range(0, len(valid_data), solve_batch_size):
+            chunk_end = min(chunk_start + solve_batch_size, len(valid_data))
             chunk_valid_data = valid_data[chunk_start:chunk_end]
             chunk_contexts = per_problem_contexts[chunk_start:chunk_end]
             chunk_global_indices = valid_global_indices[chunk_start:chunk_end]
@@ -404,6 +409,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup", action="store_true", default=True)
     parser.add_argument("--no-warmup", action="store_false", dest="warmup")
     parser.add_argument(
+        "--solve-batch-size",
+        type=int,
+        default=SOLVE_BATCH_CHUNK_SIZE,
+        help="Maximum number of problems per pRRTC batch dispatch.",
+    )
+    parser.add_argument(
         "--timing-source",
         choices=["host", "kernel"],
         default="host",
@@ -458,6 +469,7 @@ def main() -> None:
             warmup=args.warmup,
             timing_source=args.timing_source,
             jit_trace=args.jit_trace,
+            solve_batch_size=args.solve_batch_size,
             max_problems_per_set=args.max_problems_per_set,
             print_failures=args.print_failures,
         )
@@ -524,6 +536,7 @@ def main() -> None:
 
     print(f"Timing source for planning_time: {args.timing_source}")
     print(f"JIT tracing for batched pRRTC dispatch: {args.jit_trace}")
+    print(f"Configured solve batch size: {args.solve_batch_size}")
     print(f"Solved / Valid / Total # Problems: {valid - failed} / {valid} / {total}")
     print(f"Completed all problems in {df['total_time'].sum() / 1000:.3f} milliseconds")
     print(f"Total time including Python overhead: {(tock - tick) * 1000:.3f} milliseconds")

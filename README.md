@@ -2,29 +2,9 @@
 
 `cuda-rrtc` is a CUDA-accelerated implementation of the Parallel Rapidly-exploring Random Tree (pRRTC) motion planning algorithm, designed for integration with PyRoNot's robotics kinematics and collision checking framework.
 
-## Directory Structure
-
-```
-cuda-rrtc/
-├── CUDA/                    # CUDA kernels
-│   ├── prrtc_helpers.cuh    # CUDA utilities and helpers
-│   ├── prrtc_nearest_neighbor.cu
-│   ├── prrtc_extend.cu
-│   ├── prrtc_iteration.cu
-│   └── prrtc_planner.cu
-├── ffi/                     # FFI bindings
-│   └── prrtc_ffi.cc
-├── jax/                     # JAX interface
-│   ├── __init__.py
-│   └── prrtc.py
-├── build.sh                 # Build script
-├── __init__.py
-└── README.md
-```
-
 ## Key Features
 
-- **GPU-Accelerated**: Uses CUDA kernels for massive parallelism
+- **GPU-Accelerated**: Uses CUDA kernels for parallelism
 - **JAX FFI Integration**: Exposes CUDA kernels through JAX's Foreign Function Interface
 - **Batched Planning**: Supports `jax.vmap` for batched motion planning
 - **Two-Tree Bidirectional Planning**: Uses start and goal trees for efficient search
@@ -32,13 +12,23 @@ cuda-rrtc/
 - **CUDA Graph Support**: Minimal kernel launch overhead via graph replay
 - **Memory-Efficient**: Structure-of-Arrays (SoA) layout for coalesced memory access
 
-## Installation
+## Setup
+
+### PyRoFFI Dependency
+
+Install PyRoFFI
+```
+git clone https://github.com/commalab/pyronot
+cd pyronot
+pip install -e .
+pip install -r requirements.txt
+```
 
 ### Prerequisites
 
 - CUDA toolkit (11.0+)
-- JAXLib >= 0.4.14
-- Python 3.8+
+- Python 3.11+
+- PyRoFFI 
 
 ### Build
 
@@ -113,64 +103,6 @@ Optional keys:
 
 - `self_pairs`: `(n_pairs, 2)` int32 for active robot-sphere self-collision pairs
 
-To force geometric-only legacy behavior, set `allow_unsafe_no_collision=True`.
-
-### Batched Planning with vmap
-
-```python
-import jax
-import jax.numpy as jnp
-from cuda_rrtc.jax import prrtc_plan
-
-# Generate batch of planning problems
-starts = jax.random.uniform(key, (10, 7), minval=-2.0, maxval=2.0)
-goals = jax.random.uniform(key, (10, 7), minval=-2.0, maxval=2.0)
-
-# prrtc_plan expects goal_configs shaped (num_goals, dim), so give each problem
-# a per-item goal set of shape (1, dim)
-goal_sets = goals[:, None, :]
-
-# Vectorize planning across batch dimension
-plan_fn = jax.jit(
-    jax.vmap(
-        lambda s, gset: prrtc_plan(
-            start_config=s,
-            goal_configs=gset,
-            allow_unsafe_no_collision=True,
-            max_iterations=10000,
-            step_size=0.5,
-        ),
-        in_axes=(0, 0),
-    )
-)
-results = plan_fn(starts, goal_sets)
-
-# Process results
-for i, result in enumerate(results):
-    if result.solved:
-        print(f"Problem {i}: Found path with {len(result.path)} configurations")
-```
-
-### Using Lower-Level Primitives
-
-```python
-from cuda_rrtc.jax import prrtc_nearest_neighbor, prrtc_extend
-
-# Find nearest neighbor
-tree_configs = ...  # Shape: (dim, max_nodes)
-query_configs = ...  # Shape: (batch, dim)
-tree_size = ...  # Current number of nodes
-
-distances, indices = prrtc_nearest_neighbor(tree_configs, query_configs, tree_size)
-
-# Extend tree toward samples
-nearest_indices = ...  # Shape: (batch,)
-samples = ...  # Shape: (batch, dim)
-
-new_configs, parent_indices, valid_flags = prrtc_extend(
-    tree_configs, nearest_indices, samples, step_size=0.5
-)
-```
 
 ## Architecture
 
@@ -205,15 +137,6 @@ result = prrtc_plan(
     step_size=0.5,
 )
 ```
-
-JAX auto-vectorization via `vmap` is fully supported.
-
-## Performance Considerations
-
-- **Tree Size**: The planner supports trees with up to 1,000,000 nodes by default
-- **Samples Per Iteration**: `num_new_samples=128` by default. Typical tuning range is 64-256.
-- **Dimensionality**: Optimal for 7-14 DOF manipulators
-- **Step Size**: Typical values are 0.5-2.0 meters/radians depending on configuration space scale
 
 ## API Reference
 
@@ -301,44 +224,3 @@ def prrtc_extend(
     step_size: float,
 ) -> tuple[Float[Array, "batch dim"], Int[Array, "batch"], Int[Array, "batch"]]:
 ```
-
-## Integration with PyRoNot
-
-The implementation reuses PyRoNot's CUDA primitives for:
-
-- Forward kinematics
-- Collision checking
-- Robot state representations
-
-No modifications to PyRoNot are required.
-
-## Troubleshooting
-
-### Library Not Found
-
-```
-RuntimeError: pRRTC library not found at ...
-```
-
-**Solution**: Compile the library first with `bash build.sh` and ensure the `.so` file is in the `cuda-rrtc/` directory.
-
-### CUDA Errors
-
-```python
-jax.ffi.FFILaunchError: CUDA error ...
-```
-
-**Solutions**:
-- Ensure a CUDA-capable GPU is available
-- Check CUDA driver version compatibility
-- For debug builds, use `bash build.sh --debug` and Nsight Compute
-
-## References
-
-- Vectorized Accelerated Motion Planning (VAMP): https://github.com/robotlocomotion/vamp
-- pRRTC: https://github.com/lyf44/pRRTC
-- PyRoNot: https://github.com/rrax/pyronot
-
-## License
-
-MIT License
