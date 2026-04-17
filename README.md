@@ -1,6 +1,6 @@
-# cuda-rrtc: GPU-Accelerated Parallel RRTC Motion Planner
+# RRAX: A reimplementation of pRRTC through the Jax FFI
 
-`cuda-rrtc` is a CUDA-accelerated implementation of the Parallel Rapidly-exploring Random Tree (pRRTC) motion planning algorithm, designed for integration with PyRoNot's robotics kinematics and collision checking framework. See the original pRRTC paper here: [pRRTC paper](https://arxiv.org/abs/2503.06757), and the original code at [pRRTC code](https://github.com/CoMMALab/pRRTC.git).
+`RRAX` is a CUDA-accelerated implementation of the Parallel Rapidly-exploring Random Tree (pRRTC) motion planning algorithm, designed for integration with PyRoNot's robotics kinematics and collision checking framework. See the original pRRTC paper here: [pRRTC paper](https://arxiv.org/abs/2503.06757), and the original code at [pRRTC code](https://github.com/CoMMALab/pRRTC.git).
 
 ## Key Features
 
