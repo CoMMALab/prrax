@@ -47,6 +47,22 @@ class PRRTCResult(NamedTuple):
 
 _LIB_NAME = "_prrtc_planner_lib.so"
 
+# Collision-checker selection passed to the CUDA kernel as ``collision_mode``.
+#   "binary"        — pRRTC-style early-exit boolean check (fewest ops/config).
+#   "differentiable"— full smooth signed-distance-field sweep (no early exit),
+#                     mirroring pyroffi's differentiable collision kernel.
+_COLLISION_MODES = {"binary": 0, "differentiable": 1}
+
+
+def _resolve_collision_mode(collision_checker: str) -> int:
+    try:
+        return _COLLISION_MODES[collision_checker]
+    except KeyError:
+        raise ValueError(
+            f"collision_checker must be one of {sorted(_COLLISION_MODES)}, "
+            f"got {collision_checker!r}"
+        ) from None
+
 
 @lru_cache(maxsize=1)
 def _load_and_register() -> None:
@@ -98,6 +114,8 @@ def _get_prrtc_single_jit_kernel(
     dd_alpha: float,
     dd_radius: float,
     dd_min_radius: float,
+    collision_mode: int,
+    collision_margin: float,
 ):
     """Build and cache a JIT-traced single-problem FFI kernel."""
 
@@ -169,6 +187,8 @@ def _get_prrtc_single_jit_kernel(
             dim=np.int32(dim),
             max_nodes=np.int32(max_nodes),
             granularity=np.int32(granularity),
+            collision_mode=np.int32(collision_mode),
+            collision_margin=np.float32(collision_margin),
         )
 
     return jax.jit(_call)
@@ -193,6 +213,8 @@ def prrtc_plan(
     collision_context: Optional[dict[str, Array]] = None,
     allow_unsafe_no_collision: bool = False,
     jit_trace: bool = False,
+    collision_checker: str = "binary",
+    collision_margin: float = 0.02,
 ) -> PRRTCResult:
     """
     Plan a path using the parallel RRTC (pRRTC) algorithm.
@@ -222,6 +244,15 @@ def prrtc_plan(
             collision checking to be active.
         allow_unsafe_no_collision: If True, disables default collision-context
             requirement and runs geometric-only planning.
+        collision_checker: Which CUDA collision checker to use during edge
+            validation. ``"binary"`` (default) runs the pRRTC-style early-exit
+            boolean check; ``"differentiable"`` runs the full smooth
+            signed-distance-field sweep (no early exit) used by pyroffi's
+            differentiable collision kernel.
+        collision_margin: Safety margin (metres) for the ``"differentiable"``
+            checker. A configuration counts as in-collision when any robot
+            geometry lies within this margin of an obstacle. Ignored by the
+            ``"binary"`` checker.
         jit_trace: If True, run the planner FFI dispatch through a cached
             ``jax.jit`` wrapper keyed by planner hyper-parameters and input
             shape. This mostly reduces Python dispatch overhead for repeated
@@ -246,6 +277,9 @@ def prrtc_plan(
         - Supports batched planning via JAX vmap
     """
     _load_and_register()
+
+    collision_mode = _resolve_collision_mode(collision_checker)
+    collision_margin = float(collision_margin)
 
     # Extract robot properties
     start_config = jnp.atleast_1d(start_config)
@@ -374,6 +408,8 @@ def prrtc_plan(
             dd_alpha=float(dd_alpha),
             dd_radius=float(dd_radius),
             dd_min_radius=float(dd_min_radius),
+            collision_mode=int(collision_mode),
+            collision_margin=float(collision_margin),
         )
         result = traced_call(
             start_vec,
@@ -434,6 +470,8 @@ def prrtc_plan(
             dim=np.int32(dim),
             max_nodes=np.int32(max_nodes),
             granularity=np.int32(granularity),
+            collision_mode=np.int32(collision_mode),
+            collision_margin=np.float32(collision_margin),
         )
 
     # Extract result
@@ -555,6 +593,8 @@ def _get_prrtc_batch_jit_kernel(
     dd_alpha: float,
     dd_radius: float,
     dd_min_radius: float,
+    collision_mode: int,
+    collision_margin: float,
 ):
     """Build and cache a JIT-traced shared-context batch kernel."""
 
@@ -627,6 +667,8 @@ def _get_prrtc_batch_jit_kernel(
             dim=np.int32(dim),
             max_nodes=np.int32(max_nodes),
             granularity=np.int32(granularity),
+            collision_mode=np.int32(collision_mode),
+            collision_margin=np.float32(collision_margin),
         )
 
     return jax.jit(_call)
@@ -646,6 +688,8 @@ def _get_prrtc_batch_ctx_jit_kernel(
     dd_alpha: float,
     dd_radius: float,
     dd_min_radius: float,
+    collision_mode: int,
+    collision_margin: float,
 ):
     """Build and cache a JIT-traced per-problem-context batch kernel."""
 
@@ -728,6 +772,8 @@ def _get_prrtc_batch_ctx_jit_kernel(
             dim=np.int32(dim),
             max_nodes=np.int32(max_nodes),
             granularity=np.int32(granularity),
+            collision_mode=np.int32(collision_mode),
+            collision_margin=np.float32(collision_margin),
         )
 
     return jax.jit(_call)
@@ -752,6 +798,8 @@ def prrtc_plan_batch(
     collision_context: Optional[dict[str, Array] | list[Optional[dict[str, Array]]] | tuple[Optional[dict[str, Array]], ...]] = None,
     allow_unsafe_no_collision: bool = False,
     jit_trace: bool = False,
+    collision_checker: str = "binary",
+    collision_margin: float = 0.02,
 ) -> list[PRRTCResult]:
     """
     Plan paths for a batch of independent start/goal pairs in parallel on the GPU.
@@ -791,6 +839,9 @@ def prrtc_plan_batch(
         solved_mask = [r.solved for r in results]
     """
     _load_and_register()
+
+    collision_mode = _resolve_collision_mode(collision_checker)
+    collision_margin = float(collision_margin)
 
     start_configs = jnp.atleast_2d(jnp.asarray(start_configs, dtype=jnp.float32))
     batch_size = int(start_configs.shape[0])
@@ -956,6 +1007,8 @@ def prrtc_plan_batch(
                     dd_alpha=float(dd_alpha),
                     dd_radius=float(dd_radius),
                     dd_min_radius=float(dd_min_radius),
+                    collision_mode=int(collision_mode),
+                    collision_margin=float(collision_margin),
                 )
                 raw = traced_call(
                     start_configs,
@@ -1023,6 +1076,8 @@ def prrtc_plan_batch(
                     dim=np.int32(dim),
                     max_nodes=np.int32(max_nodes),
                     granularity=np.int32(granularity),
+                    collision_mode=np.int32(collision_mode),
+                    collision_margin=np.float32(collision_margin),
                 )
 
             raw = jax.device_get(raw)
@@ -1162,6 +1217,8 @@ def prrtc_plan_batch(
             dd_alpha=float(dd_alpha),
             dd_radius=float(dd_radius),
             dd_min_radius=float(dd_min_radius),
+            collision_mode=int(collision_mode),
+            collision_margin=float(collision_margin),
         )
         raw = traced_call(
             start_configs,
@@ -1207,6 +1264,8 @@ def prrtc_plan_batch(
             dim=np.int32(dim),
             max_nodes=np.int32(max_nodes),
             granularity=np.int32(granularity),
+            collision_mode=np.int32(collision_mode),
+            collision_margin=np.float32(collision_margin),
         )
 
     # Materialize all outputs from device before Python post-processing

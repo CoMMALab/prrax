@@ -182,31 +182,26 @@ struct CollisionContext {
     int n_world_halfspaces;
     int n_self_pairs;
     int enabled;
+    // Collision-checker selection:
+    //   0 = binary       — pRRTC-style early-exit boolean check (mirrors
+    //                       pyroffi's collision_binary kernel). Returns at the
+    //                       first penetrating obstacle; minimal work per config.
+    //   1 = differentiable — sweeps every (robot sphere, obstacle) pair with no
+    //                       early exit and accumulates the smooth signed-distance
+    //                       cost colldist_from_sdf(d, margin) (mirrors pyroffi's
+    //                       _collision_cuda_kernel signed-distance field). A config
+    //                       is in collision when the aggregate cost is negative,
+    //                       i.e. any sphere lies within `collision_margin`.
+    int collision_mode;
+    float collision_margin;
 };
 
-__device__ __forceinline__ bool prrtc_config_in_collision(
-    const float* cfg,
-    const CollisionContext& ctx
+// Binary (early-exit) collision check — the original pRRTC SIMT semantics.
+// FK transforms for the configuration are precomputed in T_world.
+__device__ __forceinline__ bool prrtc_config_in_collision_binary(
+    const CollisionContext& ctx,
+    const float* __restrict__ T_world
 ) {
-    if (!ctx.enabled) return false;
-    if (ctx.n_joints <= 0 || ctx.n_joints > PRRTC_MAX_JOINTS) return false;
-
-    float T_world[PRRTC_MAX_JOINTS * 7];
-    fk_single(
-        cfg,
-        ctx.twists,
-        ctx.parent_tf,
-        ctx.parent_idx,
-        ctx.act_idx,
-        ctx.mimic_mul,
-        ctx.mimic_off,
-        ctx.mimic_act_idx,
-        ctx.topo_inv,
-        T_world,
-        ctx.n_joints,
-        ctx.n_act
-    );
-
     // Robot-vs-world collision check against all primitive types.
     for (int rs = 0; rs < ctx.n_robot_spheres; ++rs) {
         const int link_idx = ctx.sphere_link_idx[rs];
@@ -276,6 +271,115 @@ __device__ __forceinline__ bool prrtc_config_in_collision(
     }
 
     return false;
+}
+
+// Differentiable (signed-distance-field) collision check. No early exit: every
+// (robot sphere, obstacle) and self pair contributes a smooth margin penalty via
+// colldist_from_sdf, exactly as pyroffi's differentiable collision kernel does.
+// The configuration is reported in collision when the accumulated cost is
+// negative — i.e. any geometry lies within `margin` of an obstacle.
+__device__ __forceinline__ bool prrtc_config_in_collision_differentiable(
+    const CollisionContext& ctx,
+    const float* __restrict__ T_world
+) {
+    const float margin = ctx.collision_margin;
+    float cost = 0.0f;
+
+    for (int rs = 0; rs < ctx.n_robot_spheres; ++rs) {
+        const int link_idx = ctx.sphere_link_idx[rs];
+        if (link_idx < 0 || link_idx >= ctx.n_joints) continue;
+
+        const float* T = &T_world[link_idx * 7];
+        const float* local = &ctx.sphere_local[rs * 3];
+        float world_pt[3];
+        apply_se3_point(T, local, world_pt);
+        const float rr = ctx.sphere_radius[rs];
+        const float sx = world_pt[0], sy = world_pt[1], sz = world_pt[2];
+
+        for (int ws = 0; ws < ctx.n_world_spheres; ++ws) {
+            const float* obs = &ctx.world_spheres[ws * 4];
+            const float d = sphere_sphere_dist(sx, sy, sz, rr,
+                                               obs[0], obs[1], obs[2], obs[3]);
+            cost += colldist_from_sdf(d, margin);
+        }
+
+        for (int wc = 0; wc < ctx.n_world_capsules; ++wc) {
+            const float* cap = &ctx.world_capsules[wc * 7];
+            const float d = sphere_capsule_dist(sx, sy, sz, rr,
+                                                cap[0], cap[1], cap[2],
+                                                cap[3], cap[4], cap[5], cap[6]);
+            cost += colldist_from_sdf(d, margin);
+        }
+
+        for (int wb = 0; wb < ctx.n_world_boxes; ++wb) {
+            const float* box = &ctx.world_boxes[wb * 15];
+            const float d = sphere_box_dist(sx, sy, sz, rr,
+                                            box[0], box[1], box[2],
+                                            box[3], box[4], box[5],
+                                            box[6], box[7], box[8],
+                                            box[9], box[10], box[11],
+                                            box[12], box[13], box[14]);
+            cost += colldist_from_sdf(d, margin);
+        }
+
+        for (int wh = 0; wh < ctx.n_world_halfspaces; ++wh) {
+            const float* hs = &ctx.world_halfspaces[wh * 6];
+            const float d = sphere_halfspace_dist(sx, sy, sz, rr,
+                                                  hs[0], hs[1], hs[2],
+                                                  hs[3], hs[4], hs[5]);
+            cost += colldist_from_sdf(d, margin);
+        }
+    }
+
+    for (int p = 0; p < ctx.n_self_pairs; ++p) {
+        const int i = ctx.self_pairs[p * 2 + 0];
+        const int j = ctx.self_pairs[p * 2 + 1];
+        if (i < 0 || j < 0 || i >= ctx.n_robot_spheres || j >= ctx.n_robot_spheres) continue;
+
+        const int link_i = ctx.sphere_link_idx[i];
+        const int link_j = ctx.sphere_link_idx[j];
+        if (link_i < 0 || link_j < 0 || link_i >= ctx.n_joints || link_j >= ctx.n_joints) continue;
+
+        float pi[3];
+        float pj[3];
+        apply_se3_point(&T_world[link_i * 7], &ctx.sphere_local[i * 3], pi);
+        apply_se3_point(&T_world[link_j * 7], &ctx.sphere_local[j * 3], pj);
+        const float d = sphere_sphere_dist(
+            pi[0], pi[1], pi[2], ctx.sphere_radius[i],
+            pj[0], pj[1], pj[2], ctx.sphere_radius[j]);
+        cost += colldist_from_sdf(d, margin);
+    }
+
+    return cost < 0.0f;
+}
+
+__device__ __forceinline__ bool prrtc_config_in_collision(
+    const float* cfg,
+    const CollisionContext& ctx
+) {
+    if (!ctx.enabled) return false;
+    if (ctx.n_joints <= 0 || ctx.n_joints > PRRTC_MAX_JOINTS) return false;
+
+    float T_world[PRRTC_MAX_JOINTS * 7];
+    fk_single(
+        cfg,
+        ctx.twists,
+        ctx.parent_tf,
+        ctx.parent_idx,
+        ctx.act_idx,
+        ctx.mimic_mul,
+        ctx.mimic_off,
+        ctx.mimic_act_idx,
+        ctx.topo_inv,
+        T_world,
+        ctx.n_joints,
+        ctx.n_act
+    );
+
+    if (ctx.collision_mode == 1) {
+        return prrtc_config_in_collision_differentiable(ctx, T_world);
+    }
+    return prrtc_config_in_collision_binary(ctx, T_world);
 }
 
 // Main pRRTC planning kernel — aligned with pRRTC parallel semantics.
@@ -711,7 +815,9 @@ static ffi::Error PrrtcPlannerImpl(
     float dd_min_radius,
     int dim,
     int max_nodes,
-    int granularity
+    int granularity,
+    int collision_mode,
+    float collision_margin
 ) {
     const int num_goals = static_cast<int>(goal_configs.dimensions()[0]);
     const int n_joints = static_cast<int>(fk_parent_idx.dimensions().size() == 0 ? 0 : fk_parent_idx.dimensions()[0]);
@@ -749,6 +855,8 @@ static ffi::Error PrrtcPlannerImpl(
     collision_ctx.n_self_pairs = n_self_pairs;
     collision_ctx.enabled = (n_joints > 0 && n_robot_spheres > 0 &&
         (n_world_spheres > 0 || n_world_capsules > 0 || n_world_boxes > 0 || n_world_halfspaces > 0 || n_self_pairs > 0)) ? 1 : 0;
+    collision_ctx.collision_mode = collision_mode;
+    collision_ctx.collision_margin = collision_margin;
 
     float* tree_a_radii = nullptr;
     float* tree_b_radii = nullptr;
@@ -1021,7 +1129,9 @@ static ffi::Error PrrtcPlannerBatchImpl(
     float dd_min_radius,
     int dim,
     int max_nodes,
-    int granularity
+    int granularity,
+    int collision_mode,
+    float collision_margin
 ) {
     const int batch     = static_cast<int>(start_configs.dimensions()[0]);
     // goal_configs is [batch, num_goals, dim]; each problem has its own goal slice
@@ -1062,6 +1172,8 @@ static ffi::Error PrrtcPlannerBatchImpl(
     collision_ctx.enabled = (n_joints > 0 && n_robot_spheres > 0 &&
         (n_world_spheres > 0 || n_world_capsules > 0 || n_world_boxes > 0 ||
          n_world_halfspaces > 0 || n_self_pairs > 0)) ? 1 : 0;
+    collision_ctx.collision_mode = collision_mode;
+    collision_ctx.collision_margin = collision_margin;
 
     // Allocate radii arrays for all problems in one shot
     float* all_ta_radii = nullptr;
@@ -1240,7 +1352,9 @@ static ffi::Error PrrtcPlannerBatchCtxImpl(
     float dd_min_radius,
     int dim,
     int max_nodes,
-    int granularity
+    int granularity,
+    int collision_mode,
+    float collision_margin
 ) {
     const int batch = static_cast<int>(start_configs.dimensions()[0]);
     const int num_goals = static_cast<int>(goal_configs.dimensions()[1]);
@@ -1410,6 +1524,8 @@ static ffi::Error PrrtcPlannerBatchCtxImpl(
             (collision_ctx.n_world_spheres > 0 || collision_ctx.n_world_capsules > 0 ||
              collision_ctx.n_world_boxes > 0 || collision_ctx.n_world_halfspaces > 0 ||
              collision_ctx.n_self_pairs > 0)) ? 1 : 0;
+        collision_ctx.collision_mode = collision_mode;
+        collision_ctx.collision_margin = collision_margin;
 
         cudaEventRecord(kernel_start_events[b], s);
         prrtc_planner_kernel<<<num_new_samples, granularity, 0, s>>>(
@@ -1521,6 +1637,8 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Attr<int>("dim")
         .Attr<int>("max_nodes")
         .Attr<int>("granularity")
+        .Attr<int>("collision_mode")
+        .Attr<float>("collision_margin")
 );
 
 XLA_FFI_DEFINE_HANDLER_SYMBOL(
@@ -1569,6 +1687,8 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Attr<int>("dim")
         .Attr<int>("max_nodes")
         .Attr<int>("granularity")
+        .Attr<int>("collision_mode")
+        .Attr<float>("collision_margin")
 );
 
 XLA_FFI_DEFINE_HANDLER_SYMBOL(
@@ -1617,4 +1737,6 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Attr<int>("dim")
         .Attr<int>("max_nodes")
         .Attr<int>("granularity")
+        .Attr<int>("collision_mode")
+        .Attr<float>("collision_margin")
 );
