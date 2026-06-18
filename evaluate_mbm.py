@@ -384,6 +384,7 @@ def evaluate_robot(
                 min_vals=lo,
                 max_vals=hi,
                 collision_context=collision_context,
+                collision_checker="binary_coarse_coop",
                 jit_trace=jit_trace,
             )
 

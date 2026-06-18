@@ -74,7 +74,11 @@ except Exception as e:
 RESOURCE_ROOT = Path(__file__).resolve().parent / "pyroffi" / "resources"
 PANDA_URDF = RESOURCE_ROOT / "panda" / "panda_spherized.urdf"
 
-CHECKERS = ("binary", "differentiable")
+# binary            — flat single-tier early-exit sweep (baseline)
+# binary_coarse     — Phase A: coarse→fine hierarchy + per-link/self culling (per-thread)
+# binary_coarse_coop— Phase B: + source-pRRTC cooperative lane-groups (shared FK, warp early-out)
+# differentiable    — full smooth signed-distance sweep (context)
+CHECKERS = ("binary", "binary_coarse", "binary_coarse_coop", "differentiable")
 
 
 def summarize(label, wall_ms, kernel_ms, results):
@@ -91,19 +95,27 @@ def summarize(label, wall_ms, kernel_ms, results):
             f"min={min(xs):8.3f}  max={max(xs):8.3f}"
         )
 
+    iters_mean = statistics.mean(iters)
+    kernel_mean = statistics.mean(kernel_ms) if kernel_ms else float("nan")
+    # Per-iteration kernel cost is the clean collision-check metric: the planner is a
+    # concurrent race so total iteration counts differ between checkers, but the cost of
+    # one sample-loop pass (dominated by the collision check) is directly comparable.
+    us_per_iter = (kernel_mean * 1000.0 / iters_mean) if iters_mean else float("nan")
+
     print(f"\n[{label}]  collision checker")
     print(f"  solved        : {solved}/{len(results)}")
     print(f"  wall time ms  : {stats(wall_ms)}")
     print(f"  kernel ms     : {stats(kernel_ms)}")
-    print(f"  iterations    : mean={statistics.mean(iters):.1f}  "
-          f"min={min(iters)}  max={max(iters)}")
+    print(f"  iterations    : mean={iters_mean:.1f}  min={min(iters)}  max={max(iters)}")
+    print(f"  kernel us/iter: {us_per_iter:.2f}")
     if costs:
         print(f"  path cost     : mean={statistics.mean(costs):.4f}")
     return {
         "solved": solved,
         "wall_mean": statistics.mean(wall_ms) if wall_ms else float("nan"),
-        "kernel_mean": statistics.mean(kernel_ms) if kernel_ms else float("nan"),
-        "iters_mean": statistics.mean(iters),
+        "kernel_mean": kernel_mean,
+        "iters_mean": iters_mean,
+        "us_per_iter": us_per_iter,
     }
 
 
@@ -170,6 +182,16 @@ def main():
     obstacles = create_collision_environment(vamp_problem)
     collision_context = build_prrtc_collision_context(robot, robot_coll, obstacles)
 
+    n_fine = int(np.asarray(collision_context["sphere_radius"]).shape[0])
+    n_coarse = int(np.asarray(collision_context["coarse_sphere_link_idx"]).shape[0])
+    n_self = int(np.asarray(collision_context["self_pairs"]).shape[0])
+    n_coarse_self = int(np.asarray(collision_context["coarse_self_pairs"]).shape[0])
+    print(
+        f"\nCoarse→fine model: world {n_fine}→{n_coarse} spheres "
+        f"({n_fine / max(n_coarse, 1):.1f}x fewer), self {n_self}→{n_coarse_self} pairs "
+        f"({n_self / max(n_coarse_self, 1):.1f}x fewer) on the coarse pre-pass."
+    )
+
     lo = np.array(robot.joints.lower_limits)
     hi = np.array(robot.joints.upper_limits)
     start_config = jnp.array(vamp_problem["start"], dtype=jnp.float32)
@@ -229,23 +251,31 @@ def main():
         summaries[checker] = summarize(checker, wall_ms, kernel_ms, results)
 
     # --- Head-to-head ---
+    # Compare per-iteration kernel cost (the per-config collision-check cost). Total time
+    # is not comparable across checkers because the concurrent planner solves in a
+    # different number of iterations depending on which block wins the race.
     print("\n" + "=" * 74)
-    print("Comparison (binary is the baseline)")
+    print("Per-iteration kernel cost (collision-check speed; lower is better)")
     print("=" * 74)
-    b, d = summaries["binary"], summaries["differentiable"]
-    for metric, key in (("wall time", "wall_mean"), ("kernel time", "kernel_mean")):
-        bv, dv = b[key], d[key]
-        if bv and np.isfinite(bv) and dv and np.isfinite(dv):
-            ratio = dv / bv
-            faster = "binary" if ratio > 1 else "differentiable"
-            print(
-                f"  {metric:11s}: binary={bv:8.3f} ms  differentiable={dv:8.3f} ms  "
-                f"({ratio:.2f}x — {faster} faster)"
-            )
-    print(
-        f"  iterations : binary={b['iters_mean']:.1f}  "
-        f"differentiable={d['iters_mean']:.1f}"
-    )
+    base = summaries["binary"]["us_per_iter"]
+    for checker in CHECKERS:
+        s = summaries[checker]
+        u = s["us_per_iter"]
+        rel = (base / u) if (u and np.isfinite(u)) else float("nan")
+        tag = "  (baseline)" if checker == "binary" else f"  ({rel:.2f}x vs binary)"
+        print(f"  {checker:14s}: {u:7.2f} us/iter{tag}")
+
+    ca = summaries["binary_coarse"]["us_per_iter"]
+    cb = summaries["binary_coarse_coop"]["us_per_iter"]
+    if base and np.isfinite(base):
+        if ca and np.isfinite(ca):
+            print(f"\nPhase A (coarse→fine vs flat binary):        {base / ca:.2f}x per check.")
+        if cb and np.isfinite(cb):
+            print(f"Phase B (coarse+cooperative vs flat binary): {base / cb:.2f}x per check.")
+        if ca and cb and np.isfinite(ca) and np.isfinite(cb):
+            print(f"Phase B vs Phase A:                          {ca / cb:.2f}x.")
+    print("\nNote: iteration counts differ by checker due to the parallel race; that is "
+          "expected and is why per-iteration cost is the comparison metric.")
     print("\nDone.")
 
 

@@ -173,6 +173,15 @@ struct CollisionContext {
     const float* world_boxes;      // [n_world_boxes, 15]    (cx,cy,cz, a1x,a1y,a1z, a2x,a2y,a2z, a3x,a3y,a3z, hl1,hl2,hl3)
     const float* world_halfspaces; // [n_world_halfspaces, 6] (nx,ny,nz, px,py,pz)
     const int* self_pairs;         // [n_self_pairs, 2]
+    // Coarse→fine culling model (one coarse bounding sphere per robot link/group). Each
+    // coarse sphere encloses the fine spheres in its group, so a coarse "clear" implies a
+    // fine "clear" (sound). Used by collision_mode 2; empty/disabled ⇒ flat fallback.
+    const int* coarse_sphere_link_idx;   // [n_coarse], FK frame index per coarse sphere
+    const float* coarse_sphere_local;    // [n_coarse, 3]
+    const float* coarse_sphere_radius;   // [n_coarse]
+    const int* fine_link_offsets;        // [n_coarse+1], group k fine range [off[k],off[k+1])
+    const int* coarse_self_pairs;        // [n_coarse_self_pairs, 2] coarse-sphere index pairs
+    const int* self_pair_ranges;         // [n_coarse_self_pairs, 2] fine self_pairs [start,end)
     int n_joints;
     int n_act;
     int n_robot_spheres;
@@ -181,7 +190,10 @@ struct CollisionContext {
     int n_world_boxes;
     int n_world_halfspaces;
     int n_self_pairs;
+    int n_coarse;
+    int n_coarse_self_pairs;
     int enabled;
+    int coarse_enabled;            // 1 ⇒ coarse arrays present and usable for mode 2
     // Collision-checker selection:
     //   0 = binary       — pRRTC-style early-exit boolean check (mirrors
     //                       pyroffi's collision_binary kernel). Returns at the
@@ -192,9 +204,30 @@ struct CollisionContext {
     //                       _collision_cuda_kernel signed-distance field). A config
     //                       is in collision when the aggregate cost is negative,
     //                       i.e. any sphere lies within `collision_margin`.
+    //   2 = binary_coarse — coarse→fine hierarchical early-exit binary check
+    //                       (mirrors source pRRTC): a coarse bounding-sphere pre-pass
+    //                       proves most free configs clear and gates the fine sweep
+    //                       per link. Falls back to mode 0 if coarse_enabled == 0.
     int collision_mode;
     float collision_margin;
 };
+
+// Maximum robot links/groups the coarse per-link "dirty" mask supports.
+#ifndef PRRTC_MAX_LINKS
+#define PRRTC_MAX_LINKS 64
+#endif
+
+// Phase B cooperative collision check: lanes that cooperate on one waypoint config.
+// Must divide the warp size (32) so groups never straddle a warp (for __syncwarp/__shfl).
+#ifndef PRRTC_CC_LANES
+#define PRRTC_CC_LANES 4
+#endif
+// Joint cap for the per-group shared FK buffer used by the cooperative path. Sized small
+// (most manipulators ≤ this) to keep shared-memory use modest; falls back to the
+// per-thread coarse check when a robot exceeds it.
+#ifndef PRRTC_CC_MAX_JOINTS
+#define PRRTC_CC_MAX_JOINTS 16
+#endif
 
 // Binary (early-exit) collision check — the original pRRTC SIMT semantics.
 // FK transforms for the configuration are precomputed in T_world.
@@ -353,6 +386,118 @@ __device__ __forceinline__ bool prrtc_config_in_collision_differentiable(
     return cost < 0.0f;
 }
 
+// Binary signed-distance test of one world-frame robot sphere against all world obstacles.
+// Early-exits (returns true) on the first penetrating obstacle.
+__device__ __forceinline__ bool prrtc_sphere_vs_world(
+    const CollisionContext& ctx, float sx, float sy, float sz, float rr
+) {
+    for (int ws = 0; ws < ctx.n_world_spheres; ++ws) {
+        const float* obs = &ctx.world_spheres[ws * 4];
+        if (sphere_sphere_dist(sx, sy, sz, rr, obs[0], obs[1], obs[2], obs[3]) <= 0.0f)
+            return true;
+    }
+    for (int wc = 0; wc < ctx.n_world_capsules; ++wc) {
+        const float* cap = &ctx.world_capsules[wc * 7];
+        if (sphere_capsule_dist(sx, sy, sz, rr, cap[0], cap[1], cap[2],
+                                cap[3], cap[4], cap[5], cap[6]) <= 0.0f)
+            return true;
+    }
+    for (int wb = 0; wb < ctx.n_world_boxes; ++wb) {
+        const float* box = &ctx.world_boxes[wb * 15];
+        if (sphere_box_dist(sx, sy, sz, rr, box[0], box[1], box[2],
+                            box[3], box[4], box[5], box[6], box[7], box[8],
+                            box[9], box[10], box[11], box[12], box[13], box[14]) <= 0.0f)
+            return true;
+    }
+    for (int wh = 0; wh < ctx.n_world_halfspaces; ++wh) {
+        const float* hs = &ctx.world_halfspaces[wh * 6];
+        if (sphere_halfspace_dist(sx, sy, sz, rr, hs[0], hs[1], hs[2],
+                                  hs[3], hs[4], hs[5]) <= 0.0f)
+            return true;
+    }
+    return false;
+}
+
+// Coarse→fine hierarchical binary check (source pRRTC style). A coarse bounding-sphere
+// pre-pass proves most free configs clear without touching the fine model; only groups
+// whose coarse sphere reports a possible hit are refined. Sound because each coarse sphere
+// encloses its group's fine spheres, so this returns the same in-collision verdict as the
+// flat binary check — just with far less work on the common (free) path.
+__device__ __forceinline__ bool prrtc_config_in_collision_binary_coarse(
+    const CollisionContext& ctx,
+    const float* __restrict__ T_world
+) {
+    const int n_coarse = ctx.n_coarse;
+    bool link_dirty[PRRTC_MAX_LINKS];
+    for (int k = 0; k < n_coarse; ++k) link_dirty[k] = false;
+
+    // --- Coarse world pre-pass: flag groups that might collide. ---
+    bool any_dirty = false;
+    for (int k = 0; k < n_coarse; ++k) {
+        const int link_idx = ctx.coarse_sphere_link_idx[k];
+        if (link_idx < 0 || link_idx >= ctx.n_joints) continue;
+        float wp[3];
+        apply_se3_point(&T_world[link_idx * 7], &ctx.coarse_sphere_local[k * 3], wp);
+        if (prrtc_sphere_vs_world(ctx, wp[0], wp[1], wp[2], ctx.coarse_sphere_radius[k])) {
+            link_dirty[k] = true;
+            any_dirty = true;
+        }
+    }
+
+    // --- Fine world refine: only the fine spheres of dirty groups. ---
+    if (any_dirty) {
+        for (int k = 0; k < n_coarse; ++k) {
+            if (!link_dirty[k]) continue;
+            const int start = ctx.fine_link_offsets[k];
+            const int end   = ctx.fine_link_offsets[k + 1];
+            for (int rs = start; rs < end; ++rs) {
+                const int link_idx = ctx.sphere_link_idx[rs];
+                if (link_idx < 0 || link_idx >= ctx.n_joints) continue;
+                float wp[3];
+                apply_se3_point(&T_world[link_idx * 7], &ctx.sphere_local[rs * 3], wp);
+                if (prrtc_sphere_vs_world(ctx, wp[0], wp[1], wp[2], ctx.sphere_radius[rs]))
+                    return true;
+            }
+        }
+    }
+
+    // --- Self-collision: coarse-gated per link pair, refine only when coarse pair touches. ---
+    for (int p = 0; p < ctx.n_coarse_self_pairs; ++p) {
+        const int ck_i = ctx.coarse_self_pairs[p * 2 + 0];
+        const int ck_j = ctx.coarse_self_pairs[p * 2 + 1];
+        if (ck_i < 0 || ck_j < 0 || ck_i >= n_coarse || ck_j >= n_coarse) continue;
+        const int cli = ctx.coarse_sphere_link_idx[ck_i];
+        const int clj = ctx.coarse_sphere_link_idx[ck_j];
+        if (cli < 0 || clj < 0 || cli >= ctx.n_joints || clj >= ctx.n_joints) continue;
+
+        float ci[3], cj[3];
+        apply_se3_point(&T_world[cli * 7], &ctx.coarse_sphere_local[ck_i * 3], ci);
+        apply_se3_point(&T_world[clj * 7], &ctx.coarse_sphere_local[ck_j * 3], cj);
+        if (sphere_sphere_dist(ci[0], ci[1], ci[2], ctx.coarse_sphere_radius[ck_i],
+                               cj[0], cj[1], cj[2], ctx.coarse_sphere_radius[ck_j]) > 0.0f)
+            continue;  // coarse pair clear ⇒ all its fine pairs clear
+
+        const int start = ctx.self_pair_ranges[p * 2 + 0];
+        const int end   = ctx.self_pair_ranges[p * 2 + 1];
+        for (int q = start; q < end; ++q) {
+            const int i = ctx.self_pairs[q * 2 + 0];
+            const int j = ctx.self_pairs[q * 2 + 1];
+            if (i < 0 || j < 0 || i >= ctx.n_robot_spheres || j >= ctx.n_robot_spheres) continue;
+            const int link_i = ctx.sphere_link_idx[i];
+            const int link_j = ctx.sphere_link_idx[j];
+            if (link_i < 0 || link_j < 0 || link_i >= ctx.n_joints || link_j >= ctx.n_joints) continue;
+            float pi[3], pj[3];
+            apply_se3_point(&T_world[link_i * 7], &ctx.sphere_local[i * 3], pi);
+            apply_se3_point(&T_world[link_j * 7], &ctx.sphere_local[j * 3], pj);
+            if (sphere_sphere_dist(pi[0], pi[1], pi[2], ctx.sphere_radius[i],
+                                   pj[0], pj[1], pj[2], ctx.sphere_radius[j]) <= 0.0f)
+                return true;
+        }
+    }
+
+    return false;
+}
+
 __device__ __forceinline__ bool prrtc_config_in_collision(
     const float* cfg,
     const CollisionContext& ctx
@@ -379,7 +524,134 @@ __device__ __forceinline__ bool prrtc_config_in_collision(
     if (ctx.collision_mode == 1) {
         return prrtc_config_in_collision_differentiable(ctx, T_world);
     }
+    if (ctx.collision_mode == 2 && ctx.coarse_enabled && ctx.n_coarse <= PRRTC_MAX_LINKS) {
+        return prrtc_config_in_collision_binary_coarse(ctx, T_world);
+    }
     return prrtc_config_in_collision_binary(ctx, T_world);
+}
+
+// Cooperative SIMT coarse→fine edge check (Phase B, source-pRRTC style). The block's
+// threads form groups of PRRTC_CC_LANES lanes; each group validates one interpolated
+// waypoint at a time (looping to cover all W waypoints of the edge). Lane 0 computes the
+// shared FK transforms once per waypoint; the lanes then split the coarse spheres, fine
+// spheres of "dirty" links, and self pairs among themselves and bail the whole group on
+// the first hit via a warp-collective vote. Sets *any_collision_sh on any collision.
+// Collective: every block thread must call this (it distributes waypoints across groups).
+__device__ __forceinline__ void prrtc_edge_cc_cooperative(
+    const float* __restrict__ base,
+    const float* __restrict__ delta,
+    int dim,
+    int W,
+    const CollisionContext& ctx,
+    float* __restrict__ cc_group_T,   // shared scratch [n_groups * PRRTC_CC_MAX_JOINTS * 7]
+    int* __restrict__ any_collision_sh
+) {
+    const int tid = threadIdx.x;
+    const int lane = tid & (PRRTC_CC_LANES - 1);
+    const int group = tid / PRRTC_CC_LANES;
+    const int n_groups = blockDim.x / PRRTC_CC_LANES;
+    if (n_groups == 0 || group >= n_groups) return;
+
+    const int lane_in_warp = tid & (WARP_SIZE - 1);
+    const unsigned group_mask =
+        ((1u << PRRTC_CC_LANES) - 1u) << ((lane_in_warp / PRRTC_CC_LANES) * PRRTC_CC_LANES);
+    const int group_lane0 = (lane_in_warp / PRRTC_CC_LANES) * PRRTC_CC_LANES;
+
+    float* myT = &cc_group_T[group * PRRTC_CC_MAX_JOINTS * 7];
+
+    for (int w = group; w < W; w += n_groups) {
+        // Uniform early-out: lane 0 reads the shared flag, broadcasts to the group so all
+        // lanes branch identically (keeps __syncwarp/__shfl well-formed).
+        int stop = 0;
+        if (lane == 0) stop = (atomicAdd(any_collision_sh, 0) != 0) ? 1 : 0;
+        stop = __shfl_sync(group_mask, stop, group_lane0);
+        if (stop) break;
+
+        float interp[CONFIG_DIM_MAX];
+        const float tf = static_cast<float>(w + 1) / static_cast<float>(W);
+        for (int d = 0; d < dim; ++d) interp[d] = base[d] + tf * delta[d];
+
+        if (lane == 0) {
+            fk_single(interp, ctx.twists, ctx.parent_tf, ctx.parent_idx, ctx.act_idx,
+                      ctx.mimic_mul, ctx.mimic_off, ctx.mimic_act_idx, ctx.topo_inv,
+                      myT, ctx.n_joints, ctx.n_act);
+        }
+        __syncwarp(group_mask);
+
+        // Coarse pre-pass: lanes split coarse spheres, build a per-group dirty bitmask.
+        unsigned long long dirty = 0ull;
+        for (int k = lane; k < ctx.n_coarse; k += PRRTC_CC_LANES) {
+            const int li = ctx.coarse_sphere_link_idx[k];
+            if (li < 0 || li >= ctx.n_joints) continue;
+            float wp[3];
+            apply_se3_point(&myT[li * 7], &ctx.coarse_sphere_local[k * 3], wp);
+            if (prrtc_sphere_vs_world(ctx, wp[0], wp[1], wp[2], ctx.coarse_sphere_radius[k]))
+                dirty |= (1ull << k);
+        }
+        for (int off = PRRTC_CC_LANES / 2; off > 0; off >>= 1)
+            dirty |= __shfl_xor_sync(group_mask, dirty, off);
+
+        // Fine world refine: lanes split the fine spheres of dirty groups, warp early-out.
+        bool hit = false;
+        for (int k = 0; k < ctx.n_coarse; ++k) {
+            if (!((dirty >> k) & 1ull)) continue;
+            const int s = ctx.fine_link_offsets[k];
+            const int e = ctx.fine_link_offsets[k + 1];
+            for (int rs = s + lane; rs < e; rs += PRRTC_CC_LANES) {
+                const int li = ctx.sphere_link_idx[rs];
+                if (li < 0 || li >= ctx.n_joints) continue;
+                float wp[3];
+                apply_se3_point(&myT[li * 7], &ctx.sphere_local[rs * 3], wp);
+                if (prrtc_sphere_vs_world(ctx, wp[0], wp[1], wp[2], ctx.sphere_radius[rs])) {
+                    hit = true;
+                    break;
+                }
+            }
+            if (__any_sync(group_mask, hit)) { hit = true; break; }
+        }
+
+        // Self-collision: lanes split coarse self pairs; refine fine pairs when coarse touches.
+        if (!hit) {
+            bool self_hit = false;
+            for (int p = lane; p < ctx.n_coarse_self_pairs; p += PRRTC_CC_LANES) {
+                const int ci = ctx.coarse_self_pairs[p * 2 + 0];
+                const int cj = ctx.coarse_self_pairs[p * 2 + 1];
+                if (ci < 0 || cj < 0 || ci >= ctx.n_coarse || cj >= ctx.n_coarse) continue;
+                const int li = ctx.coarse_sphere_link_idx[ci];
+                const int lj = ctx.coarse_sphere_link_idx[cj];
+                if (li < 0 || lj < 0 || li >= ctx.n_joints || lj >= ctx.n_joints) continue;
+                float a[3], b[3];
+                apply_se3_point(&myT[li * 7], &ctx.coarse_sphere_local[ci * 3], a);
+                apply_se3_point(&myT[lj * 7], &ctx.coarse_sphere_local[cj * 3], b);
+                if (sphere_sphere_dist(a[0], a[1], a[2], ctx.coarse_sphere_radius[ci],
+                                       b[0], b[1], b[2], ctx.coarse_sphere_radius[cj]) > 0.0f)
+                    continue;
+                const int qs = ctx.self_pair_ranges[p * 2 + 0];
+                const int qe = ctx.self_pair_ranges[p * 2 + 1];
+                for (int q = qs; q < qe; ++q) {
+                    const int i = ctx.self_pairs[q * 2 + 0];
+                    const int j = ctx.self_pairs[q * 2 + 1];
+                    if (i < 0 || j < 0 || i >= ctx.n_robot_spheres || j >= ctx.n_robot_spheres) continue;
+                    const int lii = ctx.sphere_link_idx[i];
+                    const int ljj = ctx.sphere_link_idx[j];
+                    if (lii < 0 || ljj < 0 || lii >= ctx.n_joints || ljj >= ctx.n_joints) continue;
+                    float pi[3], pj[3];
+                    apply_se3_point(&myT[lii * 7], &ctx.sphere_local[i * 3], pi);
+                    apply_se3_point(&myT[ljj * 7], &ctx.sphere_local[j * 3], pj);
+                    if (sphere_sphere_dist(pi[0], pi[1], pi[2], ctx.sphere_radius[i],
+                                           pj[0], pj[1], pj[2], ctx.sphere_radius[j]) <= 0.0f) {
+                        self_hit = true;
+                        break;
+                    }
+                }
+                if (self_hit) break;
+            }
+            hit = __any_sync(group_mask, self_hit);
+        }
+
+        if (hit && lane == 0) atomicOr(any_collision_sh, 1);
+        __syncwarp(group_mask);
+    }
 }
 
 // Main pRRTC planning kernel — aligned with pRRTC parallel semantics.
@@ -459,6 +731,16 @@ __global__ void prrtc_planner_kernel(
     __shared__ int   extension_parent_sh;
     __shared__ int   ext_idx_sh;
     __shared__ int   any_collision_sh;   // atomicOr target for per-thread CC results
+
+    // Phase B cooperative-CC scratch: per-group shared FK transforms + shared edge endpoints.
+    __shared__ float cc_group_T[(PRRTC_BLOCK_THREADS_MAX / PRRTC_CC_LANES) * PRRTC_CC_MAX_JOINTS * 7];
+    __shared__ float cc_base_sh[CONFIG_DIM_MAX];
+    __shared__ float cc_delta_sh[CONFIG_DIM_MAX];
+    // Cooperative path is selected once: coarse model present, FK fits the shared buffer,
+    // and the block is wide enough to form lane-groups. Uniform across the block.
+    const bool cc_coop = (collision_ctx.collision_mode == 3 && collision_ctx.coarse_enabled
+                          && collision_ctx.n_joints <= PRRTC_CC_MAX_JOINTS
+                          && static_cast<int>(blockDim.x) >= PRRTC_CC_LANES);
 
     // Initialize per-block Halton with shuffled primes.
     // Block 0 uses canonical ordering; other blocks are shuffled.
@@ -604,7 +886,16 @@ __global__ void prrtc_planner_kernel(
         // This mirrors pRRTC's granularity-parallel FK+CC across all block threads.
         // T_world inside prrtc_config_in_collision is stack-allocated, so concurrent
         // calls from all threads are fully independent.
-        {
+        if (cc_coop) {
+            // Cooperative path validates all blockDim.x waypoints with lane-groups.
+            if (tid < dim) {
+                cc_base_sh[tid] = t_cfgs[tid * max_nodes + nearest_idx_sh];
+                cc_delta_sh[tid] = cfg_candidate_sh[tid] - cc_base_sh[tid];
+            }
+            __syncthreads();
+            prrtc_edge_cc_cooperative(cc_base_sh, cc_delta_sh, dim, blockDim.x,
+                                      collision_ctx, cc_group_T, &any_collision_sh);
+        } else {
             const float t_frac = static_cast<float>(tid + 1) / static_cast<float>(blockDim.x);
             float interp[CONFIG_DIM_MAX];
             for (int d = 0; d < dim; ++d) {
@@ -711,7 +1002,10 @@ __global__ void prrtc_planner_kernel(
             if (tid == 0) any_collision_sh = 0;
             __syncthreads();
 
-            {
+            if (cc_coop) {
+                prrtc_edge_cc_cooperative(curr_cfg_sh, vec_sh, dim, blockDim.x,
+                                          collision_ctx, cc_group_T, &any_collision_sh);
+            } else {
                 const float t_frac = static_cast<float>(tid + 1) / static_cast<float>(blockDim.x);
                 float interp[CONFIG_DIM_MAX];
                 for (int d = 0; d < dim; ++d)
@@ -794,6 +1088,12 @@ static ffi::Error PrrtcPlannerImpl(
     ffi::Buffer<ffi::DataType::F32> world_boxes,     // [n_world_boxes, 15]
     ffi::Buffer<ffi::DataType::F32> world_halfspaces,// [n_world_halfspaces, 6]
     ffi::Buffer<ffi::DataType::S32> self_pairs,      // [n_self_pairs, 2]
+    ffi::Buffer<ffi::DataType::S32> coarse_sphere_link_idx,  // [n_coarse]
+    ffi::Buffer<ffi::DataType::F32> coarse_sphere_local,     // [n_coarse, 3]
+    ffi::Buffer<ffi::DataType::F32> coarse_sphere_radius,    // [n_coarse]
+    ffi::Buffer<ffi::DataType::S32> fine_link_offsets,       // [n_coarse+1]
+    ffi::Buffer<ffi::DataType::S32> coarse_self_pairs,       // [n_coarse_self_pairs, 2]
+    ffi::Buffer<ffi::DataType::S32> self_pair_ranges,        // [n_coarse_self_pairs, 2]
     ffi::Result<ffi::Buffer<ffi::DataType::F32>> tree_a_configs,
     ffi::Result<ffi::Buffer<ffi::DataType::F32>> tree_b_configs,
     ffi::Result<ffi::Buffer<ffi::DataType::S32>> tree_a_parents,
@@ -857,6 +1157,21 @@ static ffi::Error PrrtcPlannerImpl(
         (n_world_spheres > 0 || n_world_capsules > 0 || n_world_boxes > 0 || n_world_halfspaces > 0 || n_self_pairs > 0)) ? 1 : 0;
     collision_ctx.collision_mode = collision_mode;
     collision_ctx.collision_margin = collision_margin;
+    {
+        const int n_coarse = (coarse_sphere_link_idx.dimensions().size() == 0)
+            ? 0 : static_cast<int>(coarse_sphere_link_idx.dimensions()[0]);
+        const int n_coarse_self_pairs = (coarse_self_pairs.dimensions().size() == 0)
+            ? 0 : static_cast<int>(coarse_self_pairs.dimensions()[0]);
+        collision_ctx.coarse_sphere_link_idx = coarse_sphere_link_idx.typed_data();
+        collision_ctx.coarse_sphere_local    = coarse_sphere_local.typed_data();
+        collision_ctx.coarse_sphere_radius   = coarse_sphere_radius.typed_data();
+        collision_ctx.fine_link_offsets      = fine_link_offsets.typed_data();
+        collision_ctx.coarse_self_pairs      = coarse_self_pairs.typed_data();
+        collision_ctx.self_pair_ranges       = self_pair_ranges.typed_data();
+        collision_ctx.n_coarse               = n_coarse;
+        collision_ctx.n_coarse_self_pairs    = n_coarse_self_pairs;
+        collision_ctx.coarse_enabled = (n_coarse > 0 && n_coarse <= PRRTC_MAX_LINKS) ? 1 : 0;
+    }
 
     float* tree_a_radii = nullptr;
     float* tree_b_radii = nullptr;
@@ -1108,6 +1423,12 @@ static ffi::Error PrrtcPlannerBatchImpl(
     ffi::Buffer<ffi::DataType::F32> world_boxes,
     ffi::Buffer<ffi::DataType::F32> world_halfspaces,
     ffi::Buffer<ffi::DataType::S32> self_pairs,
+    ffi::Buffer<ffi::DataType::S32> coarse_sphere_link_idx,
+    ffi::Buffer<ffi::DataType::F32> coarse_sphere_local,
+    ffi::Buffer<ffi::DataType::F32> coarse_sphere_radius,
+    ffi::Buffer<ffi::DataType::S32> fine_link_offsets,
+    ffi::Buffer<ffi::DataType::S32> coarse_self_pairs,
+    ffi::Buffer<ffi::DataType::S32> self_pair_ranges,
     ffi::Result<ffi::Buffer<ffi::DataType::F32>> tree_a_configs,   // [batch, dim, max_nodes]
     ffi::Result<ffi::Buffer<ffi::DataType::F32>> tree_b_configs,   // [batch, dim, max_nodes]
     ffi::Result<ffi::Buffer<ffi::DataType::S32>> tree_a_parents,   // [batch, max_nodes]
@@ -1174,6 +1495,21 @@ static ffi::Error PrrtcPlannerBatchImpl(
          n_world_halfspaces > 0 || n_self_pairs > 0)) ? 1 : 0;
     collision_ctx.collision_mode = collision_mode;
     collision_ctx.collision_margin = collision_margin;
+    {
+        const int n_coarse = (coarse_sphere_link_idx.dimensions().size() == 0)
+            ? 0 : static_cast<int>(coarse_sphere_link_idx.dimensions()[0]);
+        const int n_coarse_self_pairs = (coarse_self_pairs.dimensions().size() == 0)
+            ? 0 : static_cast<int>(coarse_self_pairs.dimensions()[0]);
+        collision_ctx.coarse_sphere_link_idx = coarse_sphere_link_idx.typed_data();
+        collision_ctx.coarse_sphere_local    = coarse_sphere_local.typed_data();
+        collision_ctx.coarse_sphere_radius   = coarse_sphere_radius.typed_data();
+        collision_ctx.fine_link_offsets      = fine_link_offsets.typed_data();
+        collision_ctx.coarse_self_pairs      = coarse_self_pairs.typed_data();
+        collision_ctx.self_pair_ranges       = self_pair_ranges.typed_data();
+        collision_ctx.n_coarse               = n_coarse;
+        collision_ctx.n_coarse_self_pairs    = n_coarse_self_pairs;
+        collision_ctx.coarse_enabled = (n_coarse > 0 && n_coarse <= PRRTC_MAX_LINKS) ? 1 : 0;
+    }
 
     // Allocate radii arrays for all problems in one shot
     float* all_ta_radii = nullptr;
@@ -1331,6 +1667,12 @@ static ffi::Error PrrtcPlannerBatchCtxImpl(
     ffi::Buffer<ffi::DataType::S32> world_boxes_count,        // [batch]
     ffi::Buffer<ffi::DataType::S32> world_halfspaces_count,   // [batch]
     ffi::Buffer<ffi::DataType::S32> self_pairs_count,         // [batch]
+    ffi::Buffer<ffi::DataType::S32> coarse_sphere_link_idx,   // [n_coarse] (shared)
+    ffi::Buffer<ffi::DataType::F32> coarse_sphere_local,      // [n_coarse, 3] (shared)
+    ffi::Buffer<ffi::DataType::F32> coarse_sphere_radius,     // [n_coarse] (shared)
+    ffi::Buffer<ffi::DataType::S32> fine_link_offsets,        // [n_coarse+1] (shared)
+    ffi::Buffer<ffi::DataType::S32> coarse_self_pairs,        // [n_coarse_self_pairs, 2] (shared)
+    ffi::Buffer<ffi::DataType::S32> self_pair_ranges,         // [n_coarse_self_pairs, 2] (shared)
     ffi::Result<ffi::Buffer<ffi::DataType::F32>> tree_a_configs,   // [batch, dim, max_nodes]
     ffi::Result<ffi::Buffer<ffi::DataType::F32>> tree_b_configs,   // [batch, dim, max_nodes]
     ffi::Result<ffi::Buffer<ffi::DataType::S32>> tree_a_parents,   // [batch, max_nodes]
@@ -1526,6 +1868,21 @@ static ffi::Error PrrtcPlannerBatchCtxImpl(
              collision_ctx.n_self_pairs > 0)) ? 1 : 0;
         collision_ctx.collision_mode = collision_mode;
         collision_ctx.collision_margin = collision_margin;
+        {
+            const int n_coarse = (coarse_sphere_link_idx.dimensions().size() == 0)
+                ? 0 : static_cast<int>(coarse_sphere_link_idx.dimensions()[0]);
+            const int n_coarse_self_pairs = (coarse_self_pairs.dimensions().size() == 0)
+                ? 0 : static_cast<int>(coarse_self_pairs.dimensions()[0]);
+            collision_ctx.coarse_sphere_link_idx = coarse_sphere_link_idx.typed_data();
+            collision_ctx.coarse_sphere_local    = coarse_sphere_local.typed_data();
+            collision_ctx.coarse_sphere_radius   = coarse_sphere_radius.typed_data();
+            collision_ctx.fine_link_offsets      = fine_link_offsets.typed_data();
+            collision_ctx.coarse_self_pairs      = coarse_self_pairs.typed_data();
+            collision_ctx.self_pair_ranges       = self_pair_ranges.typed_data();
+            collision_ctx.n_coarse               = n_coarse;
+            collision_ctx.n_coarse_self_pairs    = n_coarse_self_pairs;
+            collision_ctx.coarse_enabled = (n_coarse > 0 && n_coarse <= PRRTC_MAX_LINKS) ? 1 : 0;
+        }
 
         cudaEventRecord(kernel_start_events[b], s);
         prrtc_planner_kernel<<<num_new_samples, granularity, 0, s>>>(
@@ -1615,6 +1972,12 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Arg<ffi::Buffer<ffi::DataType::S32>>()  // world_boxes_count [batch]
         .Arg<ffi::Buffer<ffi::DataType::S32>>()  // world_halfspaces_count [batch]
         .Arg<ffi::Buffer<ffi::DataType::S32>>()  // self_pairs_count [batch]
+        .Arg<ffi::Buffer<ffi::DataType::S32>>()  // coarse_sphere_link_idx
+        .Arg<ffi::Buffer<ffi::DataType::F32>>()  // coarse_sphere_local
+        .Arg<ffi::Buffer<ffi::DataType::F32>>()  // coarse_sphere_radius
+        .Arg<ffi::Buffer<ffi::DataType::S32>>()  // fine_link_offsets
+        .Arg<ffi::Buffer<ffi::DataType::S32>>()  // coarse_self_pairs
+        .Arg<ffi::Buffer<ffi::DataType::S32>>()  // self_pair_ranges
         .Ret<ffi::Buffer<ffi::DataType::F32>>()  // tree_a_configs [batch, dim, max_nodes]
         .Ret<ffi::Buffer<ffi::DataType::F32>>()  // tree_b_configs [batch, dim, max_nodes]
         .Ret<ffi::Buffer<ffi::DataType::S32>>()  // tree_a_parents [batch, max_nodes]
@@ -1665,6 +2028,12 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Arg<ffi::Buffer<ffi::DataType::F32>>()  // world_boxes
         .Arg<ffi::Buffer<ffi::DataType::F32>>()  // world_halfspaces
         .Arg<ffi::Buffer<ffi::DataType::S32>>()  // self_pairs
+        .Arg<ffi::Buffer<ffi::DataType::S32>>()  // coarse_sphere_link_idx
+        .Arg<ffi::Buffer<ffi::DataType::F32>>()  // coarse_sphere_local
+        .Arg<ffi::Buffer<ffi::DataType::F32>>()  // coarse_sphere_radius
+        .Arg<ffi::Buffer<ffi::DataType::S32>>()  // fine_link_offsets
+        .Arg<ffi::Buffer<ffi::DataType::S32>>()  // coarse_self_pairs
+        .Arg<ffi::Buffer<ffi::DataType::S32>>()  // self_pair_ranges
         .Ret<ffi::Buffer<ffi::DataType::F32>>()  // tree_a_configs [batch, dim, max_nodes]
         .Ret<ffi::Buffer<ffi::DataType::F32>>()  // tree_b_configs [batch, dim, max_nodes]
         .Ret<ffi::Buffer<ffi::DataType::S32>>()  // tree_a_parents [batch, max_nodes]
@@ -1715,6 +2084,12 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Arg<ffi::Buffer<ffi::DataType::F32>>()  // world_boxes [n_world_boxes, 15]
         .Arg<ffi::Buffer<ffi::DataType::F32>>()  // world_halfspaces [n_world_halfspaces, 6]
         .Arg<ffi::Buffer<ffi::DataType::S32>>()  // self_pairs [n_self_pairs, 2]
+        .Arg<ffi::Buffer<ffi::DataType::S32>>()  // coarse_sphere_link_idx
+        .Arg<ffi::Buffer<ffi::DataType::F32>>()  // coarse_sphere_local
+        .Arg<ffi::Buffer<ffi::DataType::F32>>()  // coarse_sphere_radius
+        .Arg<ffi::Buffer<ffi::DataType::S32>>()  // fine_link_offsets
+        .Arg<ffi::Buffer<ffi::DataType::S32>>()  // coarse_self_pairs
+        .Arg<ffi::Buffer<ffi::DataType::S32>>()  // self_pair_ranges
         .Ret<ffi::Buffer<ffi::DataType::F32>>()  // tree_a_configs [dim, max_nodes]
         .Ret<ffi::Buffer<ffi::DataType::F32>>()  // tree_b_configs [dim, max_nodes]
         .Ret<ffi::Buffer<ffi::DataType::S32>>()  // tree_a_parents [max_nodes]

@@ -51,7 +51,7 @@ _LIB_NAME = "_prrtc_planner_lib.so"
 #   "binary"        — pRRTC-style early-exit boolean check (fewest ops/config).
 #   "differentiable"— full smooth signed-distance-field sweep (no early exit),
 #                     mirroring pyroffi's differentiable collision kernel.
-_COLLISION_MODES = {"binary": 0, "differentiable": 1}
+_COLLISION_MODES = {"binary": 0, "differentiable": 1, "binary_coarse": 2, "binary_coarse_coop": 3}
 
 
 def _resolve_collision_mode(collision_checker: str) -> int:
@@ -62,6 +62,43 @@ def _resolve_collision_mode(collision_checker: str) -> int:
             f"collision_checker must be one of {sorted(_COLLISION_MODES)}, "
             f"got {collision_checker!r}"
         ) from None
+
+
+def _coarse_buffers(collision_context):
+    """Extract the optional coarse→fine culling tensors (zero-sized if absent).
+
+    Returns ``(coarse_sphere_link_idx, coarse_sphere_local, coarse_sphere_radius,
+    fine_link_offsets, coarse_self_pairs, self_pair_ranges)``. These power the
+    ``"binary_coarse"`` checker (collision_mode 2); when absent the CUDA planner
+    falls back to the flat binary sweep.
+    """
+    coarse_sphere_link_idx = jnp.zeros((0,), dtype=jnp.int32)
+    coarse_sphere_local = jnp.zeros((0, 3), dtype=jnp.float32)
+    coarse_sphere_radius = jnp.zeros((0,), dtype=jnp.float32)
+    fine_link_offsets = jnp.zeros((0,), dtype=jnp.int32)
+    coarse_self_pairs = jnp.zeros((0, 2), dtype=jnp.int32)
+    self_pair_ranges = jnp.zeros((0, 2), dtype=jnp.int32)
+    if collision_context is not None:
+        if "coarse_sphere_link_idx" in collision_context:
+            coarse_sphere_link_idx = jnp.asarray(collision_context["coarse_sphere_link_idx"], dtype=jnp.int32)
+        if "coarse_sphere_local" in collision_context:
+            coarse_sphere_local = jnp.asarray(collision_context["coarse_sphere_local"], dtype=jnp.float32)
+        if "coarse_sphere_radius" in collision_context:
+            coarse_sphere_radius = jnp.asarray(collision_context["coarse_sphere_radius"], dtype=jnp.float32)
+        if "fine_link_offsets" in collision_context:
+            fine_link_offsets = jnp.asarray(collision_context["fine_link_offsets"], dtype=jnp.int32)
+        if "coarse_self_pairs" in collision_context:
+            coarse_self_pairs = jnp.asarray(collision_context["coarse_self_pairs"], dtype=jnp.int32)
+        if "self_pair_ranges" in collision_context:
+            self_pair_ranges = jnp.asarray(collision_context["self_pair_ranges"], dtype=jnp.int32)
+    return (
+        coarse_sphere_link_idx,
+        coarse_sphere_local,
+        coarse_sphere_radius,
+        fine_link_offsets,
+        coarse_self_pairs,
+        self_pair_ranges,
+    )
 
 
 @lru_cache(maxsize=1)
@@ -140,6 +177,12 @@ def _get_prrtc_single_jit_kernel(
         world_boxes,
         world_halfspaces,
         self_pairs,
+        coarse_sphere_link_idx,
+        coarse_sphere_local,
+        coarse_sphere_radius,
+        fine_link_offsets,
+        coarse_self_pairs,
+        self_pair_ranges,
     ):
         dim = int(start_vec.shape[0])
         result_shapes = (
@@ -175,6 +218,12 @@ def _get_prrtc_single_jit_kernel(
             world_boxes,
             world_halfspaces,
             self_pairs,
+            coarse_sphere_link_idx,
+            coarse_sphere_local,
+            coarse_sphere_radius,
+            fine_link_offsets,
+            coarse_self_pairs,
+            self_pair_ranges,
             max_iterations=np.int32(max_iterations),
             step_size=np.float32(step_size),
             num_new_samples=np.int32(num_new_samples),
@@ -394,6 +443,9 @@ def prrtc_plan(
         if "self_pairs" in collision_context:
             self_pairs = jnp.asarray(collision_context["self_pairs"], dtype=jnp.int32)
 
+    (coarse_sphere_link_idx, coarse_sphere_local, coarse_sphere_radius,
+     fine_link_offsets, coarse_self_pairs, self_pair_ranges) = _coarse_buffers(collision_context)
+
     # Call FFI kernel via JAX FFI.
     if jit_trace:
         traced_call = _get_prrtc_single_jit_kernel(
@@ -432,6 +484,12 @@ def prrtc_plan(
             world_boxes,
             world_halfspaces,
             self_pairs,
+            coarse_sphere_link_idx,
+            coarse_sphere_local,
+            coarse_sphere_radius,
+            fine_link_offsets,
+            coarse_self_pairs,
+            self_pair_ranges,
         )
     else:
         result = jax.ffi.ffi_call(
@@ -458,6 +516,12 @@ def prrtc_plan(
             world_boxes,
             world_halfspaces,
             self_pairs,
+            coarse_sphere_link_idx,
+            coarse_sphere_local,
+            coarse_sphere_radius,
+            fine_link_offsets,
+            coarse_self_pairs,
+            self_pair_ranges,
             max_iterations=np.int32(max_iterations),
             step_size=np.float32(step_size),
             num_new_samples=np.int32(num_new_samples),
@@ -619,6 +683,12 @@ def _get_prrtc_batch_jit_kernel(
         world_boxes,
         world_halfspaces,
         self_pairs,
+        coarse_sphere_link_idx,
+        coarse_sphere_local,
+        coarse_sphere_radius,
+        fine_link_offsets,
+        coarse_self_pairs,
+        self_pair_ranges,
     ):
         batch_size = int(start_configs.shape[0])
         dim = int(start_configs.shape[1])
@@ -655,6 +725,12 @@ def _get_prrtc_batch_jit_kernel(
             world_boxes,
             world_halfspaces,
             self_pairs,
+            coarse_sphere_link_idx,
+            coarse_sphere_local,
+            coarse_sphere_radius,
+            fine_link_offsets,
+            coarse_self_pairs,
+            self_pair_ranges,
             max_iterations=np.int32(max_iterations),
             step_size=np.float32(step_size),
             num_new_samples=np.int32(num_new_samples),
@@ -719,6 +795,12 @@ def _get_prrtc_batch_ctx_jit_kernel(
         world_boxes_count,
         world_halfspaces_count,
         self_pairs_count,
+        coarse_sphere_link_idx,
+        coarse_sphere_local,
+        coarse_sphere_radius,
+        fine_link_offsets,
+        coarse_self_pairs,
+        self_pair_ranges,
     ):
         batch_size = int(start_configs.shape[0])
         dim = int(start_configs.shape[1])
@@ -760,6 +842,12 @@ def _get_prrtc_batch_ctx_jit_kernel(
             world_boxes_count,
             world_halfspaces_count,
             self_pairs_count,
+            coarse_sphere_link_idx,
+            coarse_sphere_local,
+            coarse_sphere_radius,
+            fine_link_offsets,
+            coarse_self_pairs,
+            self_pair_ranges,
             max_iterations=np.int32(max_iterations),
             step_size=np.float32(step_size),
             num_new_samples=np.int32(num_new_samples),
@@ -902,6 +990,10 @@ def prrtc_plan_batch(
             sphere_local = jnp.asarray(first_ctx["sphere_local"], dtype=jnp.float32)
             sphere_radius = jnp.asarray(first_ctx["sphere_radius"], dtype=jnp.float32)
 
+            # Coarse model is robot-level (shared across the batch), like the fk_/sphere_ arrays.
+            (coarse_sphere_link_idx, coarse_sphere_local, coarse_sphere_radius,
+             fine_link_offsets, coarse_self_pairs, self_pair_ranges) = _coarse_buffers(first_ctx)
+
             world_specs: list[tuple[str, int]] = [
                 ("world_spheres", 4),
                 ("world_capsules", 7),
@@ -1036,6 +1128,12 @@ def prrtc_plan_batch(
                     packed_counts["world_boxes"],
                     packed_counts["world_halfspaces"],
                     self_pairs_count,
+                    coarse_sphere_link_idx,
+                    coarse_sphere_local,
+                    coarse_sphere_radius,
+                    fine_link_offsets,
+                    coarse_self_pairs,
+                    self_pair_ranges,
                 )
             else:
                 raw = jax.ffi.ffi_call("prrtc_planner_batch_ctx", result_shapes)(
@@ -1064,6 +1162,12 @@ def prrtc_plan_batch(
                     packed_counts["world_boxes"],
                     packed_counts["world_halfspaces"],
                     self_pairs_count,
+                    coarse_sphere_link_idx,
+                    coarse_sphere_local,
+                    coarse_sphere_radius,
+                    fine_link_offsets,
+                    coarse_self_pairs,
+                    self_pair_ranges,
                     max_iterations=np.int32(max_iterations),
                     step_size=np.float32(step_size),
                     num_new_samples=np.int32(num_new_samples),
@@ -1190,6 +1294,9 @@ def prrtc_plan_batch(
         if "self_pairs"       in collision_context:
             self_pairs       = jnp.asarray(collision_context["self_pairs"],       dtype=jnp.int32)
 
+    (coarse_sphere_link_idx, coarse_sphere_local, coarse_sphere_radius,
+     fine_link_offsets, coarse_self_pairs, self_pair_ranges) = _coarse_buffers(collision_context)
+
     # Output shapes — leading batch dimension on every buffer
     result_shapes = (
         jax.ShapeDtypeStruct((batch_size, dim, max_nodes), jnp.float32),  # tree_a_configs
@@ -1241,6 +1348,12 @@ def prrtc_plan_batch(
             world_boxes,
             world_halfspaces,
             self_pairs,
+            coarse_sphere_link_idx,
+            coarse_sphere_local,
+            coarse_sphere_radius,
+            fine_link_offsets,
+            coarse_self_pairs,
+            self_pair_ranges,
         )
     else:
         raw = jax.ffi.ffi_call("prrtc_planner_batch", result_shapes)(
@@ -1252,6 +1365,8 @@ def prrtc_plan_batch(
             fk_mimic_mul, fk_mimic_off, fk_mimic_act_idx, fk_topo_inv,
             sphere_link_idx, sphere_local, sphere_radius,
             world_spheres, world_capsules, world_boxes, world_halfspaces, self_pairs,
+            coarse_sphere_link_idx, coarse_sphere_local, coarse_sphere_radius,
+            fine_link_offsets, coarse_self_pairs, self_pair_ranges,
             max_iterations=np.int32(max_iterations),
             step_size=np.float32(step_size),
             num_new_samples=np.int32(num_new_samples),

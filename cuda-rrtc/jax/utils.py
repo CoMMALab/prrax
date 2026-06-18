@@ -136,19 +136,63 @@ def build_prrtc_collision_context(robot, robot_coll, world_obstacles):
         np.arange(n_links, dtype=np.int32)[:, None],
         (n_links, n_spheres_per_link),
     )
-    sphere_link_idx_raw = link_ids[valid]
-    sphere_local = sphere_local_full[valid]
-    sphere_radius = sphere_radius_full[valid]
+    raw_link_per_sphere = link_ids[valid]              # raw link id per valid fine sphere
+    local_per_sphere = sphere_local_full[valid]        # [n_valid, 3]
+    radius_per_sphere = sphere_radius_full[valid]      # [n_valid]
 
     parent_joint_indices = np.asarray(robot.links.parent_joint_indices, dtype=np.int32)
-    sphere_link_idx = parent_joint_indices[sphere_link_idx_raw]
+    joint_per_sphere = parent_joint_indices[raw_link_per_sphere]  # FK frame per fine sphere
 
+    # --- Group fine spheres by FK frame and sort so each group is contiguous. ---
+    # The CUDA planner can then gate the fine check on a per-group "dirty" flag set by a
+    # coarse bounding-sphere pre-pass (one coarse sphere per group). Sorting by joint frame
+    # keeps each group's fine spheres in a single [offset[k], offset[k+1]) range.
+    order = np.argsort(joint_per_sphere, kind="stable")
+    sphere_link_idx = joint_per_sphere[order].astype(np.int32)
+    sphere_local = local_per_sphere[order].astype(np.float32)
+    sphere_radius = radius_per_sphere[order].astype(np.float32)
+
+    # New (sorted) fine index for each old valid-sphere position, for remapping self-pairs.
+    new_index_of_old = np.empty(order.shape[0], dtype=np.int32)
+    new_index_of_old[order] = np.arange(order.shape[0], dtype=np.int32)
+
+    # Contiguous group boundaries → one coarse bounding sphere per group.
+    if sphere_link_idx.shape[0] > 0:
+        boundaries = np.flatnonzero(np.diff(sphere_link_idx)) + 1
+        group_starts = np.concatenate(([0], boundaries))
+        group_ends = np.concatenate((boundaries, [sphere_link_idx.shape[0]]))
+    else:
+        group_starts = np.zeros((0,), dtype=np.int64)
+        group_ends = np.zeros((0,), dtype=np.int64)
+
+    coarse_sphere_link_idx = sphere_link_idx[group_starts].astype(np.int32)
+    fine_link_offsets = np.concatenate(
+        (group_starts, [sphere_link_idx.shape[0]])
+    ).astype(np.int32)
+
+    coarse_sphere_local = np.zeros((group_starts.shape[0], 3), dtype=np.float32)
+    coarse_sphere_radius = np.zeros((group_starts.shape[0],), dtype=np.float32)
+    for k, (s, e) in enumerate(zip(group_starts, group_ends)):
+        locs = sphere_local[s:e]
+        rads = sphere_radius[s:e]
+        # AABB-center bounding sphere that *encloses* every fine sphere in the group, so a
+        # coarse "clear" provably implies a fine "clear" (sound culling).
+        c = 0.5 * (locs.min(axis=0) + locs.max(axis=0))
+        coarse_sphere_local[k] = c
+        coarse_sphere_radius[k] = float(np.max(np.linalg.norm(locs - c, axis=1) + rads))
+
+    group_of_joint = {int(j): k for k, j in enumerate(coarse_sphere_link_idx)}
+
+    # --- Self-collision pairs (fine), grouped by coarse link-pair with [start,end) ranges. ---
     flat_index = np.full((n_links, n_spheres_per_link), -1, dtype=np.int32)
-    flat_index[valid] = np.arange(sphere_radius.shape[0], dtype=np.int32)
+    flat_index[valid] = new_index_of_old  # raw (link, slot) -> NEW sorted fine index
 
-    pairs = []
     active_i = np.asarray(robot_coll.active_idx_i, dtype=np.int32)
     active_j = np.asarray(robot_coll.active_idx_j, dtype=np.int32)
+    self_pair_blocks = []
+    coarse_self_pairs = []
+    self_pair_ranges = []
+    cursor = 0
     for li, lj in zip(active_i, active_j):
         a = flat_index[li]
         b = flat_index[lj]
@@ -156,10 +200,29 @@ def build_prrtc_collision_context(robot, robot_coll, world_obstacles):
         b = b[b >= 0]
         if a.size == 0 or b.size == 0:
             continue
-        pairs.append(np.stack(np.meshgrid(a, b, indexing="ij"), axis=-1).reshape(-1, 2))
+        gi = group_of_joint.get(int(parent_joint_indices[li]), -1)
+        gj = group_of_joint.get(int(parent_joint_indices[lj]), -1)
+        if gi < 0 or gj < 0:
+            continue
+        block = np.stack(np.meshgrid(a, b, indexing="ij"), axis=-1).reshape(-1, 2)
+        self_pair_blocks.append(block)
+        coarse_self_pairs.append((gi, gj))
+        self_pair_ranges.append((cursor, cursor + block.shape[0]))
+        cursor += block.shape[0]
+
     self_pairs = (
-        np.concatenate(pairs, axis=0).astype(np.int32)
-        if pairs
+        np.concatenate(self_pair_blocks, axis=0).astype(np.int32)
+        if self_pair_blocks
+        else np.zeros((0, 2), dtype=np.int32)
+    )
+    coarse_self_pairs = (
+        np.asarray(coarse_self_pairs, dtype=np.int32)
+        if coarse_self_pairs
+        else np.zeros((0, 2), dtype=np.int32)
+    )
+    self_pair_ranges = (
+        np.asarray(self_pair_ranges, dtype=np.int32)
+        if self_pair_ranges
         else np.zeros((0, 2), dtype=np.int32)
     )
 
@@ -178,6 +241,13 @@ def build_prrtc_collision_context(robot, robot_coll, world_obstacles):
         "sphere_local": sphere_local,
         "sphere_radius": sphere_radius,
         "self_pairs": self_pairs,
+        # Coarse→fine culling tensors (optional; planner falls back to a flat sweep if absent)
+        "coarse_sphere_link_idx": coarse_sphere_link_idx,
+        "coarse_sphere_local": coarse_sphere_local,
+        "coarse_sphere_radius": coarse_sphere_radius,
+        "fine_link_offsets": fine_link_offsets,
+        "coarse_self_pairs": coarse_self_pairs,
+        "self_pair_ranges": self_pair_ranges,
         **world_geom,
     }
 
