@@ -104,6 +104,50 @@ Optional keys:
 - `self_pairs`: `(n_pairs, 2)` int32 for active robot-sphere self-collision pairs
 
 
+### GPU Point-Cloud Planning (RoboGPU / OptiX)
+
+For dense environment point clouds (e.g. RealSense captures), the in-kernel
+analytic checker is impractical. `prrtc_plan_robogpu` instead validates edges
+on the GPU's ray-tracing cores using PyRoFFI's
+[`RoboGPUCollisionChecker`](https://github.com/commalab/pyroffi) (OptiX BVH over
+the point cloud).
+
+Because OptiX `optixTrace` cannot be called from inside an ordinary CUDA kernel,
+this planner is **host-driven**: it runs batched RRT-Connect on the host and
+validates each iteration's candidate edges with one batched robogpu call. This
+trades the single-kernel-launch speed of `prrtc_plan` for true point-cloud
+collision checking. (`prrtc_plan(..., collision_checker="robogpu")` is *not*
+supported and raises an error pointing here.)
+
+```python
+import jax.numpy as jnp
+import yourdfpy, pyroffi as pk
+from pyroffi.collision import RobotCollisionSpherized, RoboGPUCollisionChecker
+from cuda_rrtc.jax import prrtc_plan_robogpu
+
+urdf  = yourdfpy.URDF.load("panda.urdf")
+robot = pk.Robot.from_urdf(urdf)
+coll  = RobotCollisionSpherized.from_urdf(urdf, srdf_path="panda.srdf")
+checker = RoboGPUCollisionChecker(coll)        # build robogpu OptiX checker
+
+result = prrtc_plan_robogpu(
+    start_config=start,                        # (dim,)
+    goal_configs=goal.reshape(1, -1),          # (num_goals, dim)
+    robot=robot,
+    robogpu_checker=checker,
+    world_geom=world_geom,                     # optional analytic obstacles
+    point_cloud=pc,                            # (Mp, 3) float32 environment cloud
+    r_env=0.02,                                # env point sphere radius
+    step_size=0.5,
+    num_new_samples=128,
+)
+print(result.solved, result.cost)
+```
+
+Requires PyRoFFI's robogpu library to be built (`bash
+build_kernels/build_robogpu_collision.sh`, needs the NVIDIA OptiX SDK 7.x).
+
+
 ## Architecture
 
 ### CUDA Kernels

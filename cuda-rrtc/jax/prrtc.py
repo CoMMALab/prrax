@@ -58,6 +58,15 @@ def _resolve_collision_mode(collision_checker: str) -> int:
     try:
         return _COLLISION_MODES[collision_checker]
     except KeyError:
+        if collision_checker == "robogpu":
+            raise ValueError(
+                "collision_checker='robogpu' is not available in the monolithic "
+                "in-kernel planner: OptiX ray-tracing cannot be invoked from "
+                "inside a CUDA kernel. Use the host-driven planner instead:\n"
+                "    from cuda_rrtc.jax import prrtc_plan_robogpu\n"
+                "which validates edges with pyroffi's RoboGPUCollisionChecker "
+                "(OptiX point-cloud BVH)."
+            ) from None
         raise ValueError(
             f"collision_checker must be one of {sorted(_COLLISION_MODES)}, "
             f"got {collision_checker!r}"
@@ -325,9 +334,12 @@ def prrtc_plan(
                     expansion/connect edge validation.
         - Supports batched planning via JAX vmap
     """
+    # Validate the checker name first so an unsupported choice (e.g. "robogpu")
+    # reports a clear error before we attempt to dlopen the planner library.
+    collision_mode = _resolve_collision_mode(collision_checker)
+
     _load_and_register()
 
-    collision_mode = _resolve_collision_mode(collision_checker)
     collision_margin = float(collision_margin)
 
     # Extract robot properties
