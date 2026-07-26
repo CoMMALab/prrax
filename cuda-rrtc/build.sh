@@ -49,7 +49,10 @@ SOURCES=(
 )
 
 # Locate the jaxlib include directory that ships xla/ffi/api/ffi.h.
-JAXLIB_INC="$(python3 -c "
+# Use the active env's interpreter: a bare `python3` can resolve to a system
+# python ahead of the conda env on PATH, which won't have jaxlib.
+PYTHON="${PYTHON:-python}"
+JAXLIB_INC="$("${PYTHON}" -c "
 import os, sys
 try:
     import jaxlib

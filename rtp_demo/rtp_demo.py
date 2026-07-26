@@ -7,9 +7,9 @@ Pipeline
   robot       ──ObservedJointConfigurationTopic──▶  this demo (current q / path pacing)
 
 The arm moves side-to-side **forever**. Every leg is *replanned in real time*:
-the demo takes the latest fused point cloud off DDS, self-filters the points
-that lie on the arm itself, feeds them to the GPU pRRTC planner as environment
-collision spheres, and plans a collision-free joint-space path from the robot's
+the demo takes the latest fused point cloud off DDS, feeds it to the GPU pRRTC
+planner as environment collision spheres, and plans a collision-free
+joint-space path from the robot's
 current configuration to the next side-to-side goal. The planned path is then
 streamed (paced by the robot's observed motion) to the joint impedance
 controller. If the workspace changes between legs, the next leg is planned
@@ -66,7 +66,6 @@ import jax.numpy as jnp
 import yourdfpy
 import pyroffi as pk
 from pyroffi.collision import RobotCollisionSpherized, Sphere
-from pyroffi.collision._cuda_collision import _spherized_local_geometry
 
 
 # ---------------------------------------------------------------------------
@@ -129,7 +128,7 @@ Q_LEFT = np.array([1.3526, 0.4781, -0.2965, -1.3773, 0.2660, 1.7507, 0.4519])
 # --- Robot base pose -------------------------------------------------------
 # The robot base is mounted at a fixed offset from the world/perception frame
 # the point cloud is published in. The cloud arrives in world frame, but the
-# robot's FK (self-filter + planner collision context) runs in the base frame,
+# robot's FK (planner collision context) runs in the base frame,
 # so incoming clouds are transformed world -> base before use.
 #   X: +3.16 cm, Y: -40.00 cm, Z: 0, rotation: 90 deg CCW about Z.
 def _make_base_transform(tx, ty, tz, yaw_rad):
@@ -143,16 +142,19 @@ def _make_base_transform(tx, ty, tz, yaw_rad):
 T_WORLD_BASE = _make_base_transform(0.0316, -0.40, 0.0, np.pi / 2.0)
 T_BASE_WORLD = np.linalg.inv(T_WORLD_BASE)  # world -> base, for incoming clouds
 
-RESOURCE_ROOT = Path(__file__).resolve().parent / "pyroffi" / "resources" / "panda"
+# This file lives in rtp_demo/; resources and cuda-rrtc sit at the repo root.
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+
+RESOURCE_ROOT = _REPO_ROOT / "pyroffi" / "resources" / "panda"
 SPHERIZED_URDF = RESOURCE_ROOT / "panda_spherized.urdf"
 VISUAL_URDF = RESOURCE_ROOT / "panda.urdf"
 SRDF = RESOURCE_ROOT / "panda.srdf"
 EE_LINK = "panda_hand"
 
-CUDA_RRTC_DIR = Path(__file__).resolve().parent / "cuda-rrtc" / "jax"
+CUDA_RRTC_DIR = _REPO_ROOT / "cuda-rrtc" / "jax"
 
 # Default static point-cloud snapshot used by --override-pc-stream (world frame).
-DEFAULT_PC_SNAPSHOT = Path(__file__).resolve().parent / "fused_20260623_162357.npz"
+DEFAULT_PC_SNAPSHOT = _REPO_ROOT / "fused_20260623_162357.npz"
 
 
 _CUDA_RRTC_PKG = "cuda_rrtc_jax"
@@ -311,16 +313,14 @@ class RealTimePlanner:
 
     The robot's FK + collision-sphere geometry are baked into a static pRRTC
     collision context once; only ``world_spheres`` (the environment cloud) is
-    refreshed per leg. The cloud is first self-filtered (points lying on the arm
-    are dropped) so the robot doesn't see itself as an obstacle."""
+    refreshed per leg. The raw DDS cloud is used as-is (only transformed
+    world -> base), so points lying on the arm are treated as obstacles too."""
 
     def __init__(self, backend: str, r_env: float, max_points: int,
-                 self_filter_margin: float, step_size: float,
-                 max_iterations: int):
+                 step_size: float, max_iterations: int):
         self.backend = backend
         self.r_env = r_env
         self.max_points = max_points
-        self.self_filter_margin = self_filter_margin
         self.step_size = step_size
         self.max_iterations = max_iterations
         self.last_filtered_cloud = None  # points actually fed to the checker
@@ -360,26 +360,6 @@ class RealTimePlanner:
                       f"in-kernel CUDA planner.")
                 self.backend = "cuda"
 
-        # --- self-filter geometry (CPU FK on owning links) ------------------
-        f_local = np.asarray(_spherized_local_geometry(self.coll))  # [K, 4] xyz+r
-        NL = self.coll.num_links
-        sphere_link = np.arange(f_local.shape[0]) % NL
-        self._sf_valid = f_local[:, 3] > 0.0
-        self._sf_urdf = urdf
-        link_name_per_sphere = [self.coll.link_names[i] for i in sphere_link]
-        self._sf_link_names = [
-            link_name_per_sphere[i]
-            for i in range(len(link_name_per_sphere))
-            if self._sf_valid[i]
-        ]
-        self._sf_unique_links = sorted(set(self._sf_link_names))
-        self._sf_link_col = np.array(
-            [self._sf_unique_links.index(n) for n in self._sf_link_names],
-            dtype=np.int32,
-        )
-        self._sf_local = f_local[self._sf_valid, :3].astype(np.float64)
-        self._sf_radii = f_local[self._sf_valid, 3].astype(np.float32)
-
     # -- frame conversion ----------------------------------------------------
     @staticmethod
     def _world_to_base(cloud: np.ndarray) -> np.ndarray:
@@ -390,31 +370,6 @@ class RealTimePlanner:
         R = T_BASE_WORLD[:3, :3]
         t = T_BASE_WORLD[:3, 3]
         return (cloud @ R.T.astype(np.float32)) + t.astype(np.float32)
-
-    # -- self-filtering ------------------------------------------------------
-    def _robot_sphere_centers(self, q: np.ndarray) -> np.ndarray:
-        """World-frame centers of the robot's collision spheres at config q
-        (yourdfpy CPU forward kinematics)."""
-        self._sf_urdf.update_cfg(np.asarray(q, dtype=np.float64))
-        T = np.stack(
-            [self._sf_urdf.get_transform(name) for name in self._sf_unique_links]
-        )  # [U, 4, 4]
-        Tp = T[self._sf_link_col]  # [Kv, 4, 4]
-        local_h = np.concatenate(
-            [self._sf_local, np.ones((len(self._sf_local), 1))], axis=1
-        )
-        centers = np.einsum("kij,kj->ki", Tp, local_h)[:, :3]
-        return centers.astype(np.float32)
-
-    def self_filter(self, cloud: np.ndarray, q: np.ndarray) -> np.ndarray:
-        """Drop cloud points lying inside the robot body at configuration q."""
-        if cloud is None or len(cloud) == 0 or q is None:
-            return cloud
-        centers = self._robot_sphere_centers(q)
-        thresh = (self._sf_radii + self.r_env + self.self_filter_margin) ** 2
-        d2 = ((cloud[:, None, :] - centers[None, :, :]) ** 2).sum(-1)
-        keep = np.all(d2 > thresh[None, :], axis=1)
-        return cloud[keep]
 
     def _prep_points(self, cloud: np.ndarray) -> np.ndarray:
         if cloud is None or len(cloud) == 0:
@@ -427,17 +382,13 @@ class RealTimePlanner:
         return np.ascontiguousarray(cloud, dtype=np.float32)
 
     # -- planning ------------------------------------------------------------
-    def replan(self, start, goal, cloud, q_self):
-        """Plan a path ``start → goal`` around the (self-filtered) cloud.
+    def replan(self, start, goal, cloud):
+        """Plan a path ``start → goal`` around the raw DDS cloud.
 
         Returns ``(path[N,7] | None, n_pts, n_raw)``. ``path`` is ``None`` when
         no collision-free path was found."""
         n_raw = 0 if cloud is None else len(cloud)
         cloud = self._world_to_base(cloud)
-        if cloud is not None and q_self is not None:
-            cloud = self.self_filter(
-                np.ascontiguousarray(cloud, np.float32), q_self
-            )
         pts = self._prep_points(cloud)
         n_pts = len(pts)
         self.last_filtered_cloud = pts
@@ -479,16 +430,14 @@ class RealTimePlanner:
         return path, n_pts, n_raw
 
     # -- monitoring ----------------------------------------------------------
-    def clearance(self, configs, cloud, q_self):
-        """Min robot-sphere clearance (m) per config against the self-filtered
+    def clearance(self, configs, cloud):
+        """Min robot-sphere clearance (m) per config against the raw DDS
         ``cloud`` (point spheres of radius ``r_env``). ``+inf`` if the cloud is
         empty. Used to detect when a moving obstacle has invalidated the path
         currently being executed. Updates ``last_filtered_cloud`` so the viewer
         can show the live cloud being checked."""
         configs = np.atleast_2d(np.asarray(configs, dtype=np.float32))
         cloud = self._world_to_base(cloud)
-        if cloud is not None and q_self is not None:
-            cloud = self.self_filter(np.ascontiguousarray(cloud, np.float32), q_self)
         pts = self._prep_points(cloud)
         self.last_filtered_cloud = pts
         if len(pts) == 0:
@@ -597,8 +546,6 @@ def main():
                              "planned standoff from obstacle points")
     parser.add_argument("--max-points", type=int, default=20000,
                         help="cap on cloud points fed to the planner")
-    parser.add_argument("--self-filter-margin", type=float, default=0.06,
-                        help="extra margin (m) when culling on-robot cloud points")
     parser.add_argument("--step-size", type=float, default=0.5,
                         help="pRRTC max extension step in config space (rad)")
     parser.add_argument("--max-iterations", type=int, default=20000,
@@ -637,7 +584,7 @@ def main():
 
     print(f"[demo] Loading robot + planner backend '{args.cc}' ...")
     planner = RealTimePlanner(
-        args.cc, args.r_env, args.max_points, args.self_filter_margin,
+        args.cc, args.r_env, args.max_points,
         args.step_size, args.max_iterations,
     )
 
@@ -724,8 +671,8 @@ def main():
     cloud_warm, _ = cloud_sub.latest()
     print("[demo] Warming up planner (JIT compile) ...")
     t_warm = time.time()
-    planner.replan(q_warm, q_warm, cloud_warm, q_warm)
-    planner.clearance(np.atleast_2d(q_warm), cloud_warm, q_warm)
+    planner.replan(q_warm, q_warm, cloud_warm)
+    planner.clearance(np.atleast_2d(q_warm), cloud_warm)
     print(f"[demo] Planner warm ({(time.time() - t_warm)*1e3:.0f} ms).")
 
     # Hold the current pose first so the controller engages without a jump.
@@ -758,7 +705,7 @@ def main():
                     i = cur_idx["i"]
                 q_obs = joints_sub.latest()
                 cloud_live, _ = cloud_sub.latest()
-                clr = planner.clearance(path[i:], cloud_live, q_obs)
+                clr = planner.clearance(path[i:], cloud_live)
                 if viz is not None:
                     viz.set_cloud(planner.last_filtered_cloud)
                 if float(np.min(clr)) < args.safety_margin:
@@ -817,7 +764,7 @@ def main():
             q_obs = joints_sub.latest()
             start = q_obs if q_obs is not None else goal
             t_plan = time.time()
-            path, n_pts, n_raw = planner.replan(start, goal, cloud, q_obs)
+            path, n_pts, n_raw = planner.replan(start, goal, cloud)
             dt = time.time() - t_plan
             if viz is not None:
                 viz.set_cloud(planner.last_filtered_cloud)

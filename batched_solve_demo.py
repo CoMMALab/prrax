@@ -48,7 +48,7 @@ except Exception as e:
     sys.exit(1)
 
 
-RESOURCE_ROOT = Path("/home/scoumar/Work/rrax/pyroffi/resources")
+RESOURCE_ROOT = Path(__file__).resolve().parent / "pyroffi" / "resources"
 PANDA_URDF = RESOURCE_ROOT / "panda" / "panda_spherized.urdf"
 
 
