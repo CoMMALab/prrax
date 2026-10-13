@@ -31,6 +31,12 @@
 #include "glass.cuh"         // GLASS: thread-tier BLAS / LAPACK / Lie-group ops
 #include "glass_solve.cuh"   // GRiM: tier_posv over GLASS
 
+// Threads per edge waypoint (pRRTC uses 4): blocks run PRRAX_WP_LANES * W threads for W waypoints;
+// the lanes of a waypoint split its collision check and every thread is a stage-1 steer particle.
+#ifndef PRRAX_WP_LANES
+#define PRRAX_WP_LANES 4
+#endif
+
 #define PRRAX_CONS_MAX 4
 #define PRRAX_CONS_HDR 12
 #define PRRAX_CONS_STRIDE 28
@@ -113,29 +119,23 @@ __device__ float tsr_eval(const float* __restrict__ con, const float* __restrict
     const float e2 = tsr_error(con, T_ee, T_obj, x, d);
     if (!jac) return e2;
 
-    // Jx = d x / d q from the geometric Jacobian (world linear velocity of the frame origin,
-    // world angular velocity): translation of the offset point rotated into the reference
-    // frame; rotation through the inverse left Jacobian of log.
+    // Jx = d x / d q from the geometric Jacobian Je (rows: world linear velocity of the frame
+    // origin, world angular velocity), with R = rotation of wTr^-1 and off = the offset point:
+    //     Jx_t = R (Jv - [off]x Jw),      Jx_r = Jl^-1(log R_r) R Jw.
+    // Row-major 3 x n_q blocks are column-major n_q x 3, so each block is one GLASS gemm
+    // C^T = B^T M^T with the 3x3 factor M (column-major) transposed.
+    constexpr uint32_t N = dim;
     const float* Je = J + e * 6 * R::n_solved;
-    float off[3], qw_inv[4], Jl[9];
+    float off[3], Rm[9], S[9], M2[9], Jl[9], M3[9];
     for (int k = 0; k < 3; ++k) off[k] = T_obj[4 + k] - T_ee[4 + k];
-    const float* q_wr_inv = con + CON_WTR_INV;
-    for (int k = 0; k < 4; ++k) qw_inv[k] = q_wr_inv[k];
-    glass::thread::so3_left_jacobian_inv(x + 3, Jl);   // column-major
-    for (int a = 0; a < dim; ++a) {
-        const float v[3] = {Je[0 * dim + a], Je[1 * dim + a], Je[2 * dim + a]};
-        const float w[3] = {Je[3 * dim + a], Je[4 * dim + a], Je[5 * dim + a]};
-        const float vp[3] = {v[0] + w[1] * off[2] - w[2] * off[1],
-                             v[1] + w[2] * off[0] - w[0] * off[2],
-                             v[2] + w[0] * off[1] - w[1] * off[0]};
-        float vr[3], wr[3];
-        quat_rotate(qw_inv, vp, vr);
-        quat_rotate(qw_inv, w, wr);
-        for (int i = 0; i < 3; ++i) {
-            Jx[i * dim + a] = vr[i];
-            Jx[(3 + i) * dim + a] = Jl[0 * 3 + i] * wr[0] + Jl[1 * 3 + i] * wr[1] + Jl[2 * 3 + i] * wr[2];
-        }
-    }
+    glass::thread::quat_to_rot<float, glass::QuatLayout::wxyz>(con + CON_WTR_INV, Rm);
+    glass::thread::skew(off, S);
+    glass::thread::gemm<float, 3, 3, 3>(-1.f, Rm, S, M2);                      // -R [off]x
+    glass::thread::so3_left_jacobian_inv(x + 3, Jl);
+    glass::thread::gemm<float, 3, 3, 3>(1.f, Jl, Rm, M3);                      // Jl^-1 R
+    glass::thread::gemm<float, N, 3, 3, false, true>(1.f, Je, Rm, Jx);         // R Jv
+    glass::thread::gemm<float, N, 3, 3, false, true>(1.f, Je + 3 * N, M2, 1.f, Jx);   // - R [off]x Jw
+    glass::thread::gemm<float, N, 3, 3, false, true>(1.f, Je + 3 * N, M3, Jx + 3 * N);
     (void)cp;
     return e2;
 }
@@ -173,13 +173,15 @@ __device__ float tsr_step(const float* __restrict__ con, const float* __restrict
 // Early exit: gives up as soon as *stop < me (another thread's result makes this one moot).
 __device__ bool tsr_project(const float* __restrict__ cp, float* __restrict__ q,
                             const float* __restrict__ lo, const float* __restrict__ hi,
-                            const volatile int* stop = nullptr, int me = 0)
+                            const volatile int* stop = nullptr, int me = 0,
+                            const volatile int* abort = nullptr)
 {
     constexpr int dim = R::n_q;
     const int n = static_cast<int>(cp[CONS_N]);
     const int iters = static_cast<int>(cp[CONS_ITERS]);
     for (int it = 0; it <= iters; ++it) {
         if (stop && *stop < me) return false;
+        if (abort && *abort != 0) return false;   // the problem is already solved
         bool moved = false;
         for (int c = 0; c < n; ++c) {
             float len;
@@ -236,10 +238,17 @@ __device__ __forceinline__ float hash_normal(unsigned bid, unsigned iter, unsign
 __device__ bool constrained_extend(const float* __restrict__ cp, const float* q_from,
                                    const float* q_target, float step,
                                    const float* __restrict__ lo, const float* __restrict__ hi,
-                                   float* wp_sh, int* flag_sh, unsigned bid, unsigned call)
+                                   float* wp_sh, int* flag_sh, unsigned bid, unsigned call,
+                                   const int* solved)
 {
+    const volatile int* abort = solved;   // projections stop once the problem is solved
+    if (threadIdx.x == 0) *flag_sh = *abort != 0;
+    __syncthreads();
+    if (*flag_sh) return false;   // block-uniform
     constexpr int dim = R::n_q;
-    const int tid = threadIdx.x, W = blockDim.x;
+    // W waypoints, handled by the first W threads; every thread is a stage-1 particle.
+    const int tid = threadIdx.x, W = blockDim.x / PRRAX_WP_LANES, NP = blockDim.x;
+    const bool lead = tid < W;
     const float dist_full = sqrtf(sq_dist(q_from, q_target));
     if (dist_full < 1e-8f) return false;
     const float dist = fminf(dist_full, step);
@@ -252,16 +261,16 @@ __device__ bool constrained_extend(const float* __restrict__ cp, const float* q_
 
     if (static_cast<int>(cp[CONS_MODE]) == 0) {
         // Stage 1: perturbed steer particles; the lowest converged thread wins.
-        if (tid == 0) *flag_sh = W;
+        if (tid == 0) *flag_sh = NP;
         __syncthreads();
         const float eps = tid == 0 ? 0.f : cp[CONS_SIGMA] * hash_normal(bid, call, tid);
         for (int k = 0; k < dim; ++k) q[k] = q_from[k] + (dist + eps) * v[k];
         // Early exit: a thread stops once a lower thread has converged (it would lose).
-        const bool ok = tsr_project(cp, q, lo, hi, flag_sh, tid);
+        const bool ok = tsr_project(cp, q, lo, hi, flag_sh, tid, abort);
         if (ok) atomicMin(flag_sh, tid);
         __syncthreads();
         const int winner = *flag_sh;
-        if (winner == W) return false;
+        if (winner == NP) return false;
         if (tid == winner) for (int k = 0; k < dim; ++k) wp_sh[(W - 1) * CONFIG_DIM_MAX + k] = q[k];
         __syncthreads();
         const float* q_proj = wp_sh + (W - 1) * CONFIG_DIM_MAX;
@@ -277,14 +286,18 @@ __device__ bool constrained_extend(const float* __restrict__ cp, const float* q_
         float qp[CONFIG_DIM_MAX];
         for (int k = 0; k < dim; ++k) qp[k] = q_proj[k];
         __syncthreads();
-        const float t = static_cast<float>(tid + 1) / W;
-        for (int k = 0; k < dim; ++k) q[k] = q_from[k] + t * (qp[k] - q_from[k]);
-        const bool wp_ok = (tid == W - 1) || tsr_project(cp, q, lo, hi, flag_sh, 0);
-        for (int k = 0; k < dim; ++k) mine[k] = (tid == W - 1) ? qp[k] : q[k];
-        if (!wp_ok) atomicMin(flag_sh, -1);
+        if (lead) {
+            const float t = static_cast<float>(tid + 1) / W;
+            for (int k = 0; k < dim; ++k) q[k] = q_from[k] + t * (qp[k] - q_from[k]);
+            const bool wp_ok = (tid == W - 1) || tsr_project(cp, q, lo, hi, flag_sh, 0, abort);
+            for (int k = 0; k < dim; ++k) mine[k] = (tid == W - 1) ? qp[k] : q[k];
+            if (!wp_ok) atomicMin(flag_sh, -1);
+        }
         __syncthreads();
-        const float* prev = tid == 0 ? q_from : wp_sh + (tid - 1) * CONFIG_DIM_MAX;
-        if (*flag_sh >= 0 && sq_dist(mine, prev) > max_gap * max_gap) atomicMin(flag_sh, -1);
+        if (lead) {
+            const float* prev = tid == 0 ? q_from : wp_sh + (tid - 1) * CONFIG_DIM_MAX;
+            if (*flag_sh >= 0 && sq_dist(mine, prev) > max_gap * max_gap) atomicMin(flag_sh, -1);
+        }
         __syncthreads();
         return *flag_sh >= 0;
     }
@@ -292,8 +305,9 @@ __device__ bool constrained_extend(const float* __restrict__ cp, const float* q_
     // cpRRTC: joint projection of the lerp to q_steer with smoothing, prefix-frozen by prog.
     __shared__ int prog_sh;
     __shared__ int valid_sh[64];
-    for (int k = 0; k < dim; ++k)
-        mine[k] = q_from[k] + (static_cast<float>(tid + 1) / W) * dist * v[k];
+    if (lead)
+        for (int k = 0; k < dim; ++k)
+            mine[k] = q_from[k] + (static_cast<float>(tid + 1) / W) * dist * v[k];
     if (tid == 0) { prog_sh = -1; *flag_sh = 0; }
     __syncthreads();
     const int iters = static_cast<int>(cp[CONS_ITERS]);
@@ -301,7 +315,7 @@ __device__ bool constrained_extend(const float* __restrict__ cp, const float* q_
     for (int it = 0; it < iters; ++it) {
         const int prog = prog_sh;
         bool diverged = false;
-        if (tid > prog) {
+        if (lead && tid > prog) {
             const float* prev = tid == 0 ? q_from : wp_sh + (tid - 1) * CONFIG_DIM_MAX;
             for (int k = 0; k < dim; ++k) q[k] = mine[k];
             const float gap = sqrtf(sq_dist(q, prev));
@@ -327,7 +341,7 @@ __device__ bool constrained_extend(const float* __restrict__ cp, const float* q_
             while (p + 1 < W && valid_sh[p + 1]) ++p;
             prog_sh = p;
         }
-        if (tid > prog && !valid_sh[tid]) for (int k = 0; k < dim; ++k) mine[k] = q[k];
+        if (lead && tid > prog && !valid_sh[tid]) for (int k = 0; k < dim; ++k) mine[k] = q[k];
         __syncthreads();
         if (*flag_sh != 0) return false;
         if (prog_sh == W - 1) return true;

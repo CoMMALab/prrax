@@ -210,7 +210,8 @@ def _planner_call(name: str, batch: int, dim: int, max_nodes: int, jit: bool, wp
     attrs = {k: (np.float32(v) if isinstance(v, float) else np.int32(v)) for k, v in attrs.items()}
 
     def call(*args):
-        return jax.ffi.ffi_call(name, shapes)(*args, max_nodes=np.int32(max_nodes), **attrs)
+        return jax.ffi.ffi_call(name, shapes)(*args, max_nodes=np.int32(max_nodes),
+                                              batch=np.int32(batch), dim=np.int32(dim), **attrs)
 
     return jax.jit(call) if jit else call
 
@@ -258,8 +259,9 @@ def _solve(
                          "utils.build_prrtc_collision_context(robot, robot_coll, obstacles)")
     if step_size <= 0.0:
         raise ValueError("step_size must be > 0")
-    if granularity < 1 or (granularity & (granularity - 1)) != 0 or granularity > 64:
-        raise ValueError(f"granularity must be a power of 2 <= 64, got {granularity}")
+    # 4 threads per waypoint (PRRAX_WP_LANES in CUDA/prrtc_constraint.cuh), at most 128 per block.
+    if granularity < 1 or (granularity & (granularity - 1)) != 0 or granularity > 32:
+        raise ValueError(f"granularity must be a power of 2 <= 32, got {granularity}")
     if projection.mode not in _PROJ_MODES:
         raise ValueError(f"projection.mode must be one of {sorted(_PROJ_MODES)}")
     ee = tuple(sorted({c.ee_joint for cons in constraints for c in cons}))
@@ -278,6 +280,7 @@ def _solve(
     max_vals = np.asarray(np.pi * np.ones(dim) if max_vals is None else max_vals, np.float32)
     packed = np.stack([_pack_constraints(list(c), ee, projection) for c in constraints])
     wps = int(max_nodes) * (int(granularity) - 1) * dim if any(constraints) else 1
+    worlds = _pack_worlds(contexts)
     call = _planner_call(
         names[0], batch, dim, int(max_nodes), bool(jit_trace), wps, int(max_path_points),
         max_iterations=int(max_iterations), step_size=float(step_size),
@@ -286,8 +289,12 @@ def _solve(
         dd_alpha=float(dd_alpha), dd_radius=float(dd_radius), dd_min_radius=float(dd_min_radius),
         granularity=int(granularity), collision_mode=collision_mode,
         collision_margin=float(collision_margin),
+        num_goals=int(goal_configs.shape[1]), mw0=worlds[0].shape[1], mw1=worlds[1].shape[1],
+        mw2=worlds[2].shape[1], mw3=worlds[3].shape[1],
     )
-    raw = call(start_configs, goal_configs, min_vals, max_vals, *_pack_worlds(contexts), packed)
+    # One host->device copy: every input in one float32 buffer (layout: PrrtcPlannerImpl).
+    raw = call(np.concatenate([a.astype(np.float32, copy=False).ravel() for a in (
+        start_configs, goal_configs, min_vals, max_vals, *worlds, packed)]))
     # Only the small outputs and the traced path leave the device (trees on request), in one
     # transfer for small batches (whole path buffers), per problem for large ones.
     small = (raw[4], raw[6], raw[7], raw[8], raw[9], raw[13])
@@ -373,7 +380,7 @@ def prrtc_plan(
         max_iterations: Maximum number of planning iterations (per block).
         step_size: Maximum extension step size.
         num_new_samples: Number of blocks, each extending toward one sample per iteration.
-        granularity: Threads per block (= waypoints checked per edge). Power of 2, max 64.
+        granularity: Waypoints checked per edge (4 threads each). Power of 2, max 32.
         max_nodes: Maximum nodes per tree.
         balance_mode: Tree balancing mode (0/1/2) matching pRRTC settings.
         tree_ratio: Balance threshold ratio used by mode 1/2.

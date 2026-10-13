@@ -144,9 +144,13 @@ build_kernels/build_robogpu_collision.sh`, needs the NVIDIA OptiX SDK 7.x).
 
 ### CUDA Kernels
 
-- **CUDA/prrtc_planner.cu**: the planner kernel (sample, nearest neighbor, extend, connect, all
-  in one persistent kernel per problem), its FFI handler, and FK / constraint entry points used to
-  validate a build.
+- **CUDA/prrtc_planner.cu**: the planner (sample, nearest neighbor, extend, connect) and its FFI
+  handler, plus FK / constraint entry points used to validate a build. A call is three launches:
+  batch setup (roots, root projection), one persistent planning kernel for the whole batch, and
+  path tracing. In the planning kernel every block works on one problem and, once it is solved,
+  moves to the unsolved problem with the fewest blocks, so a batch's hardest problems get the
+  whole GPU. Each edge waypoint is handled by 4 threads (as in pRRTC): they split its collision
+  check, and all threads are steer particles during projection. Inputs arrive packed in one buffer.
 - **CUDA/prrtc_constraint.cuh**: TSR error, cyclic LM projection, and the constrained extend step.
   The linear algebra and SO(3) math are GLASS thread-tier routines (`gemm`, `gemv`, `posv` via
   GRiM's `tier_posv`, `so3_left_jacobian_inv`, `axpy`/`nrm2`/`dot`) rather than hand-rolled loops.
