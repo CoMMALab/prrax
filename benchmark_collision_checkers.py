@@ -66,7 +66,7 @@ try:
     timed_prrtc_solve = utils_mod.timed_prrtc_solve
 except Exception as e:
     print(f"cuda-rrtc import error: {e}")
-    print("Make sure the library is compiled: cd cuda-rrtc && bash build.sh")
+    print("The planner is built per robot on first use (needs nvcc, pyroffi-grim with GRiM and cricket2).")
     sys.exit(1)
 
 

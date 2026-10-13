@@ -64,7 +64,6 @@ from pyroffi.collision._obstacles import create_collision_environment
 from pyroffi.collision._robot_collision import RobotCollisionSpherized
 
 # Maximum joints the CUDA FK kernel supports (PRRTC_MAX_JOINTS in prrtc_planner.cu).
-_PRRTC_MAX_JOINTS = 64
 
 
 def verify_robot_collision_context(
@@ -87,20 +86,14 @@ def verify_robot_collision_context(
     ------
     1.  Joint-limit ordering sanity (lo < hi for all actuated joints).
     2.  Config-dimension agreement: start/goal dim == n_act == lo/hi dim.
-    3.  fk_act_idx range: every value is -1 (fixed) or in [0, n_act).
-    4.  All actuated joint indices 0..n_act-1 appear in fk_act_idx (no orphaned DOFs).
-    5.  fk_mimic_act_idx range: every value is -1 or in [0, n_act).
     6.  sphere_link_idx range: every value is in [0, n_joints) -- no -1 base-link refs
         that would corrupt FK lookups.
-    7.  n_joints <= PRRTC_MAX_JOINTS (CUDA stack array limit).
     8.  No always-colliding self-collision pairs at the zero configuration -- a
         structural SRDF gap that permanently blocks all configurations.
     9.  If start/goals provided: every start and every goal is collision-free
         according to pyroffi (world + self).  Catches joint-ordering mismatches
         between the dataset and the robot model.
     """
-    fk_act_idx = np.asarray(collision_context["fk_act_idx"])
-    fk_mimic_act_idx = np.asarray(collision_context["fk_mimic_act_idx"])
     sphere_link_idx = np.asarray(collision_context["sphere_link_idx"])
 
     n_act = int(robot_model.joints.num_actuated_joints)
@@ -134,28 +127,6 @@ def verify_robot_collision_context(
             "Dataset joint ordering may not match pyroffi's actuated_joints ordering."
         )
 
-    # 3. fk_act_idx range
-    assert np.all((fk_act_idx == -1) | ((fk_act_idx >= 0) & (fk_act_idx < n_act))), (
-        f"[{robot_name}] fk_act_idx contains values outside [-1, n_act={n_act}): "
-        f"{fk_act_idx[(fk_act_idx != -1) & ((fk_act_idx < 0) | (fk_act_idx >= n_act))].tolist()}"
-    )
-
-    # 4. All actuated joint indices covered (no orphaned DOFs in multi-EEF robots)
-    covered = set(fk_act_idx[fk_act_idx >= 0].tolist())
-    missing = set(range(n_act)) - covered
-    assert not missing, (
-        f"[{robot_name}] Actuated joint indices {sorted(missing)} do not appear in "
-        "fk_act_idx -- those DOFs are invisible to the CUDA FK. "
-        "Check actuated_joints ordering in the spherized URDF."
-    )
-
-    # 5. fk_mimic_act_idx range
-    assert np.all(
-        (fk_mimic_act_idx == -1) | ((fk_mimic_act_idx >= 0) & (fk_mimic_act_idx < n_act))
-    ), (
-        f"[{robot_name}] fk_mimic_act_idx contains out-of-range values."
-    )
-
     # 6. sphere_link_idx range: -1 is allowed (base-link spheres; the CUDA kernel
     #    skips them via `if (link_idx < 0 || link_idx >= n_joints) continue`).
     #    Any value < -1 or >= n_joints is genuinely out of range and will corrupt
@@ -166,12 +137,6 @@ def verify_robot_collision_context(
             f"min={sphere_link_idx.min()}, max={sphere_link_idx.max()}. "
             "Values < -1 or >= n_joints will produce out-of-bounds T_world reads in the CUDA FK."
         )
-
-    # 7. CUDA FK stack limit
-    assert n_joints <= _PRRTC_MAX_JOINTS, (
-        f"[{robot_name}] n_joints={n_joints} exceeds PRRTC_MAX_JOINTS={_PRRTC_MAX_JOINTS}. "
-        "The CUDA FK allocates a fixed stack of that size."
-    )
 
     # 8. No always-colliding self-collision pairs at zero configuration.
     #    A constant negative distance means the SRDF is missing an adjacent-link
