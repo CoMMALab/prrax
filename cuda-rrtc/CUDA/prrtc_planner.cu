@@ -520,6 +520,41 @@ __device__ __forceinline__ bool prrtc_config_in_collision(
     return prrtc_config_in_collision_binary(ctx, T_world, first, stride);
 }
 
+
+// VAMP's gap sweep (vamp planning/constraints/local_planner.hh, trace): the gap from the
+// previous waypoint to waypoint `slot` is swept in ceil(|gap| * resolution) substeps; for a
+// constrained edge each substep is projected onto the manifold, must stay within twice the
+// substep length of the linear interpolant, and is collision-checked; the waypoint itself is
+// checked as is. resolution = the robot's VAMP resolution (PandaMarker: 32 per rad). True if
+// the gap is invalid.
+#ifndef PRRAX_RESOLUTION
+#define PRRAX_RESOLUTION 32.0f
+#endif
+#ifndef PRRAX_GAP_MAX_SUB
+#define PRRAX_GAP_MAX_SUB 64
+#endif
+__device__ __forceinline__ bool prrtc_gap_invalid(const float* prev, const float* wp, int dim,
+                                                  const CollisionContext& ctx, int part,
+                                                  const float* cons, const float* lo, const float* hi) {
+    float d2 = 0.f;
+    for (int k = 0; k < dim; ++k) { const float e = wp[k] - prev[k]; d2 += e * e; }
+    const float gap = sqrtf(d2);
+    const int n = min(PRRAX_GAP_MAX_SUB, max(1, static_cast<int>(ceilf(gap * PRRAX_RESOLUTION))));
+    const float max_drift2 = 4.f * (gap / n) * (gap / n);
+    float x[CONFIG_DIM_MAX], lin[CONFIG_DIM_MAX];
+    for (int s = 1; s < n; ++s) {
+        const float t = static_cast<float>(s) / n;
+        for (int k = 0; k < dim; ++k) x[k] = lin[k] = prev[k] + t * (wp[k] - prev[k]);
+        if (cons) {
+            if (!prrax_cons::tsr_project(cons, x, lo, hi)) return true;
+            if (prrax_cons::sq_dist(x, lin) >= max_drift2) return true;
+        }
+        if (prrtc_config_in_collision(x, ctx, part)) return true;
+    }
+    for (int k = 0; k < dim; ++k) x[k] = wp[k];
+    return prrtc_config_in_collision(x, ctx, part);
+}
+
 // Cooperative SIMT coarse→fine edge check (Phase B, source-pRRTC style). The block's
 // threads form groups of PRRTC_CC_LANES lanes; each group validates one interpolated
 // waypoint at a time (looping to cover all W waypoints of the edge). Lane 0 computes the
@@ -535,7 +570,9 @@ __device__ __forceinline__ void prrtc_edge_cc_cooperative(
     const CollisionContext& ctx,
     float* __restrict__ cc_group_T,   // shared scratch [n_groups * PRRTC_CC_MAX_JOINTS * 7]
     int* __restrict__ any_collision_sh,
-    const float* __restrict__ waypoints = nullptr   // [W * CONFIG_DIM_MAX]; else base + t * delta
+    const float* __restrict__ waypoints = nullptr,  // [W * CONFIG_DIM_MAX]; else base + t * delta
+    const float* __restrict__ cons = nullptr,       // constrained: gap substeps are projected
+    const float* __restrict__ lo = nullptr, const float* __restrict__ hi = nullptr
 ) {
     const int tid = threadIdx.x;
     const int lane = tid & (PRRTC_CC_LANES - 1);
@@ -550,22 +587,44 @@ __device__ __forceinline__ void prrtc_edge_cc_cooperative(
 
     float* myT = &cc_group_T[group * PRRTC_CC_MAX_JOINTS * 7];
 
-    for (int w = group; w < W; w += n_groups) {
+    // Group g sweeps the gap from waypoint w-1 (base for w = 0) to waypoint w as
+    // prrtc_gap_invalid does (VAMP's resolution): substeps s = 1..n, s = n the waypoint itself.
+    for (int item = group; ; item += n_groups) {
         // Uniform early-out: lane 0 reads the shared flag, broadcasts to the group so all
         // lanes branch identically (keeps __syncwarp/__shfl well-formed).
         int stop = 0;
         if (lane == 0) stop = (atomicAdd(any_collision_sh, 0) != 0) ? 1 : 0;
         stop = __shfl_sync(group_mask, stop, group_lane0);
         if (stop) break;
+        const int w = item / PRRAX_GAP_MAX_SUB, s = item % PRRAX_GAP_MAX_SUB + 1;
+        if (w >= W) break;
 
-        float interp[CONFIG_DIM_MAX];
-        const float tf = static_cast<float>(w + 1) / static_cast<float>(W);
-        if (waypoints) for (int d = 0; d < dim; ++d) interp[d] = waypoints[w * CONFIG_DIM_MAX + d];
-        else edge_point(base, delta, tf, interp);
-
-        if (lane == 0) {
-            grim::robot::frame_poses(interp, nullptr, myT);
+        float interp[CONFIG_DIM_MAX], prev[CONFIG_DIM_MAX];
+        if (waypoints) {
+            for (int d = 0; d < dim; ++d) interp[d] = waypoints[w * CONFIG_DIM_MAX + d];
+            for (int d = 0; d < dim; ++d) prev[d] = w == 0 ? base[d] : waypoints[(w - 1) * CONFIG_DIM_MAX + d];
+        } else {
+            edge_point(base, delta, static_cast<float>(w + 1) / static_cast<float>(W), interp);
+            edge_point(base, delta, static_cast<float>(w) / static_cast<float>(W), prev);
         }
+        float d2 = 0.f;
+        for (int d = 0; d < dim; ++d) { const float e = interp[d] - prev[d]; d2 += e * e; }
+        const float gap = sqrtf(d2);
+        const int n = min(PRRAX_GAP_MAX_SUB, max(1, static_cast<int>(ceilf(gap * PRRAX_RESOLUTION))));
+        if (s > n) continue;   // group-uniform: past this gap's substeps
+        int bad = 0;
+        if (lane == 0) {
+            if (s < n) {
+                float lin[CONFIG_DIM_MAX];
+                const float t = static_cast<float>(s) / n;
+                for (int d = 0; d < dim; ++d) interp[d] = lin[d] = prev[d] + t * (interp[d] - prev[d]);
+                if (cons) bad = !prrax_cons::tsr_project(cons, interp, lo, hi)
+                              || prrax_cons::sq_dist(interp, lin) >= 4.f * (gap / n) * (gap / n);
+            }
+            if (!bad) grim::robot::frame_poses(interp, nullptr, myT);
+        }
+        bad = __shfl_sync(group_mask, bad, group_lane0);
+        if (bad) { if (lane == 0) atomicOr(any_collision_sh, 1); continue; }
         __syncwarp(group_mask);
 
         // Coarse pre-pass: lanes split coarse spheres, build a per-group dirty bitmask.
@@ -695,7 +754,11 @@ __device__ void plan_problem(
     int dim,
     int max_nodes,
     int granularity,
-    const float* __restrict__ constraints     // [PRRAX_CONS_SIZE]; n = 0 => unconstrained
+    const float* __restrict__ constraints,    // [PRRAX_CONS_SIZE]; n = 0 => unconstrained
+    float* __restrict__ tree_a_cost,          // [max_nodes] cost-to-come (edge chord lengths)
+    float* __restrict__ tree_b_cost,
+    float best_cost,                          // AO-x: find a path cheaper than this; FLT_MAX = any path
+    int num_goals
 ) {
     const int tid = threadIdx.x;
     __shared__ CollisionContext ctx_sh;
@@ -720,6 +783,7 @@ __device__ void plan_problem(
     // Per-block Halton state (like pRRTC's per-block HaltonState)
     __shared__ int halton_st[CONFIG_DIM_MAX];
     __shared__ int prime_order[16];
+    __shared__ unsigned rng_sh;           // xorshift: AO-x cost budget, PHS radius, goal pick
     __shared__ int vamp_tree_id;
 
     // Sample and candidate configs
@@ -749,6 +813,9 @@ __device__ void plan_problem(
     __shared__ float target_sh[CONFIG_DIM_MAX];
     __shared__ int   cflag_sh;
     __shared__ int   new_base_sh;
+    // AO-x (Hauser & Zhou; MR. POP / pAORRTC): the sample's cost budget, the candidate's
+    // cost-to-come, and the connect's cost so far.
+    __shared__ float c_rand_sh, g_new_sh, conn_g_sh;
     for (int i = tid; i < PRRAX_CONS_SIZE; i += blockDim.x) cons_sh[i] = constraints[i];
 
     // Phase B cooperative-CC scratch: per-group shared FK transforms + shared edge endpoints.
@@ -776,15 +843,34 @@ __device__ void plan_problem(
         for (int d = 0; d < 16; ++d) prime_order[d] = primes[d];
         for (int d = 0; d < CONFIG_DIM_MAX; ++d) {
             // pRRTC starts each dimension stream at its first Halton sample.
-            halton_st[d] = 1;
+            halton_st[d] = 1 + (best_cost < FLT_MAX ? (__float_as_int(best_cost) & 0xffff) : 0);
         }
         vamp_tree_id = 0;
+        rng_sh = (bid + 1) * 2654435761u ^ __float_as_uint(best_cost);
     }
     __syncthreads();
     const bool constrained = cons_sh[CONS_N] > 0.0f;
     // Two lanes per waypoint (PRRAX_WP_LANES): W = granularity waypoints per edge.
     const int W = blockDim.x / PRRAX_WP_LANES;
     unsigned proj_calls = 0;   // per-block counter seeding the McVAMP steer perturbations
+    const bool ao = best_cost < FLT_MAX;
+
+    // tid 0 helpers. Uniform in (0, 1).
+    auto rand01 = [&]() -> float {
+        rng_sh ^= rng_sh << 13; rng_sh ^= rng_sh >> 17; rng_sh ^= rng_sh << 5;
+        return (static_cast<float>(rng_sh >> 8) + 0.5f) * (1.0f / 16777216.0f);
+    };
+    // Admissible cost-to-go heuristic: distance from q to tree t's nearest root.
+    auto root_dist = [&](int t, const float* q) -> float {
+        const float* cfgs = (t == 0) ? tree_a_configs : tree_b_configs;
+        float best = FLT_MAX;
+        for (int r = 0; r < (t == 0 ? 1 : num_goals); ++r) {
+            float dsq = 0.0f;
+            for (int d = 0; d < dim; ++d) { const float e = cfgs[d * max_nodes + r] - q[d]; dsq += e * e; }
+            best = fminf(best, dsq);
+        }
+        return sqrtf(best);
+    };
 
     // Collision check of the edge's W waypoints: base + (w+1)/W * delta, or the projected
     // waypoints in wp_sh for a constrained edge. Collective; true if any waypoint collides.
@@ -796,15 +882,22 @@ __device__ void plan_problem(
         if (any_collision_sh) return true;
         if (cc_coop) {
             prrtc_edge_cc_cooperative(base, delta, dim, W, collision_ctx, cc_group_T,
-                                      &any_collision_sh, constrained ? wp_sh : nullptr);
+                                      &any_collision_sh, constrained ? wp_sh : nullptr,
+                                      constrained ? cons_sh : nullptr, min_vals, max_vals);
         } else {
             // Waypoint tid % W; lane tid / W checks its share of the collision pairs.
             const int slot = tid % W;
-            float interp[CONFIG_DIM_MAX];
+            float interp[CONFIG_DIM_MAX], prev[CONFIG_DIM_MAX];
             const float t_frac = static_cast<float>(slot + 1) / static_cast<float>(W);
-            if (constrained) for (int d = 0; d < dim; ++d) interp[d] = wp_sh[slot * CONFIG_DIM_MAX + d];
-            else edge_point(base, delta, t_frac, interp);
-            if (prrtc_config_in_collision(interp, collision_ctx, tid / W)) atomicOr(&any_collision_sh, 1);
+            if (constrained) {
+                for (int d = 0; d < dim; ++d) interp[d] = wp_sh[slot * CONFIG_DIM_MAX + d];
+                for (int d = 0; d < dim; ++d) prev[d] = slot == 0 ? base[d] : wp_sh[(slot - 1) * CONFIG_DIM_MAX + d];
+            } else {
+                edge_point(base, delta, t_frac, interp);
+                edge_point(base, delta, static_cast<float>(slot) / static_cast<float>(W), prev);
+            }
+            if (prrtc_gap_invalid(prev, interp, dim, collision_ctx, tid / W, constrained ? cons_sh : nullptr,
+                                  min_vals, max_vals)) atomicOr(&any_collision_sh, 1);
         }
         __syncthreads();
         return any_collision_sh != 0;
@@ -814,8 +907,9 @@ __device__ void plan_problem(
     // edge the last projected waypoint). A constrained edge's W-1 interior waypoints go to
     // edge_wps[node] (expanded into the path on the host), keeping the searched tree small.
     // Collective; returns the new node's index, or -1 when the tree is full.
-    auto append_edge = [&](int t_tree, int parent, const float* cfg) -> int {
+    auto append_edge = [&](int t_tree, int parent, const float* cfg, float g) -> int {
         float* cfgs = (t_tree == 0) ? tree_a_configs : tree_b_configs;
+        float* costs = (t_tree == 0) ? tree_a_cost : tree_b_cost;
         int* parents = (t_tree == 0) ? tree_a_parents : tree_b_parents;
         float* radii = (t_tree == 0) ? tree_a_radii : tree_b_radii;
         float* wps = (t_tree == 0) ? edge_wps_a : edge_wps_b;
@@ -827,6 +921,7 @@ __device__ void plan_problem(
             } else {
                 new_base_sh = idx;
                 radii[idx] = FLT_MAX;
+                costs[idx] = g;
             }
         }
         __syncthreads();
@@ -853,9 +948,11 @@ __device__ void plan_problem(
     // 2 * ceil(d / step) + 2 steps, reached within connect_eps). Collective; true if it
     // connected (connection_info written).
     __shared__ int conn_stop_sh;
-    auto connect_from = [&](int t_tree, int from_idx, const float* from_cfg) -> bool {
+    // AO-x: only nodes through which the path stays under best_cost (from_g = from_idx's cost).
+    auto connect_from = [&](int t_tree, int from_idx, const float* from_cfg, float from_g) -> bool {
         const int o_tree = 1 - t_tree;
         const float* o_cfgs = (o_tree == 0) ? tree_a_configs : tree_b_configs;
+        const float* o_cost = (o_tree == 0) ? tree_a_cost : tree_b_cost;
         // Fresh completed count for o_tree — more nodes may have been added by other blocks.
         const int comp_o_conn = atomicAdd(&completed[o_tree], 0);
 
@@ -866,10 +963,12 @@ __device__ void plan_problem(
             if (volatile_load(&o_parents[i]) < 0) continue;   // claimed, not yet written
             float dsq = 0.0f;
             for (int d = 0; d < dim; ++d) {
-                const float diff = o_cfgs[d * max_nodes + i] - from_cfg[d];
+                const float diff = __ldcg(&o_cfgs[d * max_nodes + i]) - from_cfg[d];
                 dsq += diff * diff;
             }
-            if (dsq < local_min_sq2) { local_min_sq2 = dsq; local_near2 = i; }
+            if (dsq < local_min_sq2 && (!ao || __ldcg(&o_cost[i]) + sqrtf(dsq) < best_cost - from_g)) {
+                local_min_sq2 = dsq; local_near2 = i;
+            }
         }
         sdata[tid]     = local_min_sq2;
         sindex_sh[tid] = local_near2;
@@ -883,9 +982,11 @@ __device__ void plan_problem(
             __syncthreads();
         }
 
+        if (sdata[0] == FLT_MAX) return false;   // AO-x: no node within the budget
         if (tid == 0) {
             const float cd         = sqrtf(sdata[0]);
             connect_nearest_idx_sh = sindex_sh[0];
+            conn_g_sh = from_g;
             // n_extensions = ceil(dist / step_size); 0 means already touching (immediate connect)
             int n_ext = 0;
             if (step_size > 1e-8f && cd > 1e-8f) {
@@ -897,7 +998,7 @@ __device__ void plan_problem(
             // Direction vector for one extension step (matches pRRTC's vec computation)
             for (int d = 0; d < dim; ++d) {
                 curr_cfg_sh[d] = from_cfg[d];
-                target_sh[d]   = o_cfgs[d * max_nodes + connect_nearest_idx_sh];
+                target_sh[d]   = __ldcg(&o_cfgs[d * max_nodes + connect_nearest_idx_sh]);
                 vec_sh[d]      = (n_ext > 0)
                     ? (target_sh[d] - from_cfg[d]) / static_cast<float>(n_ext)
                     : 0.0f;
@@ -932,12 +1033,21 @@ __device__ void plan_problem(
             // Advance (vec for unconstrained, the projected end for constrained) and append.
             __syncthreads();
             if (tid == 0) {
-                for (int d = 0; d < dim; ++d)
-                    curr_cfg_sh[d] = constrained ? wp_sh[(W - 1) * CONFIG_DIM_MAX + d]
-                                                 : curr_cfg_sh[d] + vec_sh[d];
+                float len = 0.0f;
+                for (int d = 0; d < dim; ++d) {
+                    const float next = constrained ? wp_sh[(W - 1) * CONFIG_DIM_MAX + d]
+                                                   : curr_cfg_sh[d] + vec_sh[d];
+                    len += (next - curr_cfg_sh[d]) * (next - curr_cfg_sh[d]);
+                    curr_cfg_sh[d] = next;
+                }
+                conn_g_sh += sqrtf(len);
+                // AO-x: a (constrained) detour that can no longer beat best_cost ends the connect.
+                cflag_sh = ao && conn_g_sh + sqrtf(prrax_cons::sq_dist(curr_cfg_sh, target_sh))
+                                 + __ldcg(&o_cost[connect_nearest_idx_sh]) >= best_cost;
             }
             __syncthreads();
-            const int eidx = append_edge(t_tree, extension_parent_sh, curr_cfg_sh);
+            if (cflag_sh) { extension_failed = true; break; }
+            const int eidx = append_edge(t_tree, extension_parent_sh, curr_cfg_sh, conn_g_sh);
             if (eidx < 0) { extension_failed = true; break; }
             if (tid == 0) extension_parent_sh = eidx;
             __syncthreads();
@@ -997,6 +1107,36 @@ __device__ void plan_problem(
                 const int prime = prime_order[d % 16];
                 const float val = halton_next_runtime(prime, halton_st[d]);
                 sample_sh[d] = min_vals[d] + val * (max_vals[d] - min_vals[d]);
+                // AO-x: Halton -> Gaussian for the direction of the informed sample below.
+                if (ao) cfg_candidate_sh[d] = normcdfinvf(fminf(fmaxf(val, 1e-6f), 1.0f - 1e-6f));
+            }
+            // Informed sampling: uniform in the prolate hyperspheroid of paths cheaper than
+            // best_cost between the start and a random goal (several goals: their union).
+            const float* f1 = tree_a_configs;
+            const float* f2 = tree_b_configs + (num_goals > 1 ? (rng_sh % num_goals) : 0);
+            float dmin = 0.0f;
+            for (int d = 0; d < dim; ++d) { const float e = f2[d * max_nodes] - f1[d * max_nodes]; dmin += e * e; }
+            dmin = sqrtf(dmin);
+            if (ao && best_cost > dmin) {
+                float* y = cfg_candidate_sh;
+                float nrm = 0.0f;
+                for (int d = 0; d < dim; ++d) nrm += y[d] * y[d];
+                const float r = powf(rand01(), 1.0f / dim) * rsqrtf(fmaxf(nrm, 1e-12f));
+                const float conj = sqrtf(best_cost * best_cost - dmin * dmin);
+                for (int d = 0; d < dim; ++d) y[d] *= r * 0.5f * (d == 0 ? best_cost : conj);
+                // Householder reflection taking e1 to the focal axis a: x = y - 2 v (v.y) / (v.v), v = e1 - a.
+                float vy = 0.0f, vv = 0.0f;
+                for (int d = 0; d < dim; ++d) {
+                    const float a = (dmin > 1e-6f) ? (f2[d * max_nodes] - f1[d * max_nodes]) / dmin : (d == 0);
+                    const float v = (d == 0) - a;
+                    vy += v * y[d]; vv += v * v;
+                }
+                const float k = (vv > 1e-12f) ? 2.0f * vy / vv : 0.0f;
+                for (int d = 0; d < dim; ++d) {
+                    const float a = (dmin > 1e-6f) ? (f2[d * max_nodes] - f1[d * max_nodes]) / dmin : (d == 0);
+                    const float c = 0.5f * (f1[d * max_nodes] + f2[d * max_nodes]);
+                    sample_sh[d] = fminf(fmaxf(y[d] - k * ((d == 0) - a) + c, min_vals[d]), max_vals[d]);
+                }
             }
 
             // Tree-side balance: uses bid / gridDim.x ratio, matching pRRTC's
@@ -1034,8 +1174,18 @@ __device__ void plan_problem(
 
             t_tree_id_sh = t_tree_id;
             o_tree_id_sh = 1 - t_tree_id;
+
+            // AO-x cost budget c_rand ~ U[g_hat, best - h_hat]; -1 rejects a sample outside
+            // the informed set.
+            c_rand_sh = FLT_MAX;
+            if (ao) {
+                const float g_hat = root_dist(t_tree_id, sample_sh), h_hat = root_dist(1 - t_tree_id, sample_sh);
+                c_rand_sh = (g_hat + h_hat >= best_cost) ? -1.0f
+                          : g_hat + rand01() * (best_cost - g_hat - h_hat);
+            }
         }
         __syncthreads();
+        if (c_rand_sh < 0.0f) continue;
 
         const int t_tree_id  = t_tree_id_sh;
         const int o_tree_id  = o_tree_id_sh;
@@ -1044,6 +1194,7 @@ __device__ void plan_problem(
         float* t_cfgs_w      = (t_tree_id == 0) ? tree_a_configs : tree_b_configs;
         int*   t_parents     = (t_tree_id == 0) ? tree_a_parents : tree_b_parents;
         float* t_radii       = (t_tree_id == 0) ? tree_a_radii   : tree_b_radii;
+        const float* t_cost  = (t_tree_id == 0) ? tree_a_cost    : tree_b_cost;
 
         // Read completed counts (nodes fully written) — safe search range.
         // Uses min(allocated, completed) pattern from pRRTC.
@@ -1058,10 +1209,13 @@ __device__ void plan_problem(
             if (volatile_load(&t_parents[i]) < 0) continue;   // claimed, not yet written
             float dsq = 0.0f;
             for (int d = 0; d < dim; ++d) {
-                const float diff = t_cfgs[d * max_nodes + i] - sample_sh[d];
+                const float diff = __ldcg(&t_cfgs[d * max_nodes + i]) - sample_sh[d];
                 dsq += diff * diff;
             }
-            if (dsq < local_min_sq) { local_min_sq = dsq; local_near = i; }
+            // AO-x: nearest among the nodes that reach the sample within its budget.
+            if (dsq < local_min_sq && (!ao || __ldcg(&t_cost[i]) + sqrtf(dsq) < c_rand_sh)) {
+                local_min_sq = dsq; local_near = i;
+            }
         }
         sdata[tid]     = local_min_sq;
         sindex_sh[tid] = local_near;
@@ -1080,11 +1234,11 @@ __device__ void plan_problem(
             nearest_idx_sh  = sindex_sh[0];
             // Avoid over-pruning while trees are still tiny; otherwise one side can
             // stall at its root and appear as one-tree-only growth.
-            should_skip_sh  = (dynamic_domain && t_radii[nearest_idx_sh] < nd);
+            should_skip_sh  = sdata[0] == FLT_MAX || (dynamic_domain && __ldcg(&t_radii[nearest_idx_sh]) < nd);
             if (!should_skip_sh) {
                 const float sc = (nd > 1e-8f) ? fminf(1.0f, step_size / nd) : 1.0f;
                 for (int d = 0; d < dim; ++d) {
-                    const float base    = t_cfgs[d * max_nodes + nearest_idx_sh];
+                    const float base    = __ldcg(&t_cfgs[d * max_nodes + nearest_idx_sh]);
                     cfg_candidate_sh[d] = base + (sample_sh[d] - base) * sc;
                 }
             }
@@ -1096,7 +1250,7 @@ __device__ void plan_problem(
 
         // --- Extend toward the sample (edge collision check: one waypoint per thread) ---
         if (tid < dim) {
-            near_sh[tid] = t_cfgs[tid * max_nodes + nearest_idx_sh];
+            near_sh[tid] = __ldcg(&t_cfgs[tid * max_nodes + nearest_idx_sh]);
             cc_delta_sh[tid] = cfg_candidate_sh[tid] - near_sh[tid];
         }
         __syncthreads();
@@ -1108,6 +1262,14 @@ __device__ void plan_problem(
             if (edge_ok && tid < dim) cfg_candidate_sh[tid] = wp_sh[(W - 1) * CONFIG_DIM_MAX + tid];
             __syncthreads();
         }
+        // Candidate's cost-to-come; AO-x prunes it if even a straight line from it to the
+        // other tree's roots cannot beat best_cost.
+        if (edge_ok && tid == 0) {
+            g_new_sh = __ldcg(&t_cost[nearest_idx_sh]) + sqrtf(prrax_cons::sq_dist(near_sh, cfg_candidate_sh));
+            cflag_sh = ao && g_new_sh + root_dist(o_tree_id, cfg_candidate_sh) >= best_cost;
+        }
+        __syncthreads();
+        if (edge_ok && cflag_sh) continue;
         if (edge_ok) edge_ok = !edge_in_collision(near_sh, cc_delta_sh);
 
         if (!edge_ok) {
@@ -1119,10 +1281,10 @@ __device__ void plan_problem(
         }
 
         if (tid == 0 && dynamic_domain) prrtc_radius_grow_atomic(t_radii, nearest_idx_sh, dd_alpha);
-        const int new_idx = append_edge(t_tree_id, nearest_idx_sh, cfg_candidate_sh);
+        const int new_idx = append_edge(t_tree_id, nearest_idx_sh, cfg_candidate_sh, g_new_sh);
         if (new_idx < 0) { if (stopped()) return; continue; }
 
-        if (connect_from(t_tree_id, new_idx, cfg_candidate_sh)) {
+        if (connect_from(t_tree_id, new_idx, cfg_candidate_sh, g_new_sh)) {
             atomicMax(iter_count, iters_sh);
             return;
         }
@@ -1201,10 +1363,10 @@ __device__ void trace_path(const int* __restrict__ solved, const int* __restrict
 
 // Per-problem pointers of the batch buffers (problem p of a [batch, ...] layout).
 struct BatchLayout {
-    float *ta_cfg, *tb_cfg, *wps_a, *wps_b, *radii;
+    float *ta_cfg, *tb_cfg, *wps_a, *wps_b, *radii, *cost;   // radii, cost: [2, batch, max_nodes]
     int *ta_par, *tb_par, *sizes, *completed, *iters, *conn, *solved, *work, *active;
     unsigned long long *t_start, *t_end;
-    const float *starts, *goals, *cons, *w_sph, *w_cap, *w_box, *w_hs;
+    const float *starts, *goals, *cons, *w_sph, *w_cap, *w_box, *w_hs, *best;
     const float* counts;
     int batch, dim, num_goals, max_nodes, max_w[4];
     size_t wps_size;
@@ -1225,6 +1387,11 @@ __global__ void prrax_init_batch_kernel(BatchLayout L) {
     init_problem(L.starts + p * L.dim, L.goals + (size_t)p * L.num_goals * L.dim, ta, tb, ta_par, tb_par,
                  L.radii + p * n, L.radii + (L.batch + p) * n, L.sizes + p * 2, L.completed + p * 2,
                  L.iters + p, L.conn + p * 3, L.solved + p, L.t_start + p, L.num_goals, L.dim, L.max_nodes);
+    for (int g = threadIdx.x; g < L.num_goals; g += blockDim.x) L.cost[(L.batch + p) * n + g] = 0.0f;
+    if (threadIdx.x == 0) {
+        L.cost[p * n] = 0.0f;
+        if (L.best[p] < 0.0f) { L.solved[p] = -1; L.t_end[p] = L.t_start[p]; }   // AO-x pass: skip
+    }
     __syncthreads();
 }
 
@@ -1264,7 +1431,8 @@ __global__ void prrax_plan_batch_kernel(
             min_vals, max_vals, L.sizes + p * 2, L.completed + p * 2, L.iters + p, L.conn + p * 3, L.solved + p,
             ctx, L.counts + p * 4, max_iterations, step_size, num_new_samples,
             balance_mode, tree_ratio, dynamic_domain, dd_alpha, dd_radius, dd_min_radius,
-            L.dim, L.max_nodes, granularity, L.cons + p * PRRAX_CONS_SIZE);
+            L.dim, L.max_nodes, granularity, L.cons + p * PRRAX_CONS_SIZE,
+            L.cost + p * n, L.cost + (L.batch + p) * n, L.best[p], L.num_goals);
         __syncthreads();
         if (threadIdx.x == 0) {
             atomicSub(&L.active[p], 1);
@@ -1293,6 +1461,233 @@ __global__ void prrax_path_batch_kernel(BatchLayout L, float* __restrict__ path,
                w1, L.dim, L.max_nodes, max_path);
 }
 
+
+// Path simplification of each solved problem's traced path (MR. POP's simplifier, on the
+// manifold). One round is PRRAX_BSPLINE_STEPS sweeps of B-spline smoothing, then the shortest
+// path through a shortcut graph (run first, see PrrtcPlannerImpl), as launches of this kernel
+// with `phase`:
+//   0 / 1  smoothing of the odd / even interior waypoints (independent given their neighbours):
+//          one moves to 1/4 prev + 1/2 self + 1/4 next (projected when constrained) if that is
+//          shorter and both new chords are collision-free;
+//   2      shortcut graph: every pair of up to PRRAX_SC_ANCHORS evenly spaced anchor waypoints
+//          whose chord is shorter than the path between them is an edge if the planner's own
+//          connect (straight steps, or projected steps when constrained; each step's W
+//          waypoints checked like a tree edge) reaches one from the other: lens [K, K];
+//          (after phase 4: the whole path, block 0 of each problem);
+//   3      (block 0 of each problem) shortest path over those edges and the original sub-paths
+//          between consecutive anchors; the path is rebuilt (a constrained shortcut is
+//          re-connected with the same seed, reproducing its segment).
+// gridDim.x = batch * blocks per problem; phases 0-2 spread their work over a problem's blocks
+// (MR. POP: 16 blocks and grid syncs). scratch: seg [grid, seg_max, dim] (one connect per
+// block), rebuilt paths [batch, max_path, dim], lens [batch, K, K].
+#ifndef PRRAX_SC_ANCHORS
+#define PRRAX_SC_ANCHORS 64
+#endif
+#define PRRAX_BSPLINE_STEPS 3          // MR. POP's bspline_step
+#define PRRAX_BSPLINE_MIN_CHANGE 0.01f // MR. POP's bspline_min_change
+__global__ void prrax_shortcut_batch_kernel(
+    BatchLayout L, float* __restrict__ path, int* __restrict__ path_len,
+    const float* __restrict__ lo, const float* __restrict__ hi, int collision_mode,
+    float collision_margin, float step_size, int phase, int max_path,
+    float* __restrict__ seg_buf, int seg_max, int seg_blocks)   // seg_blocks: the largest grid
+{
+    const int p = blockIdx.x % L.batch, sub = blockIdx.x / L.batch, nb = gridDim.x / L.batch;
+    const int tid = threadIdx.x, dim = L.dim, W = blockDim.x / PRRAX_WP_LANES;
+    constexpr int KM = PRRAX_SC_ANCHORS;
+    __shared__ CollisionContext ctx_sh;
+    __shared__ int zero_sh, cflag_sh, any_sh, nseg_sh, len_sh, go_sh;
+    __shared__ float mid_sh[CONFIG_DIM_MAX];
+    __shared__ float cons_sh[PRRAX_CONS_SIZE];
+    __shared__ float wp_sh[PRRTC_BLOCK_THREADS_MAX * CONFIG_DIM_MAX];
+    __shared__ float cur_sh[CONFIG_DIM_MAX], tgt_sh[CONFIG_DIM_MAX];
+    __shared__ float cc_group_T[(PRRTC_BLOCK_THREADS_MAX / PRRTC_CC_LANES) * PRRTC_CC_MAX_JOINTS * 7];
+    float* P = path + (size_t)p * max_path * dim;
+    float* S = seg_buf + (size_t)blockIdx.x * seg_max * dim;
+    float* Q = seg_buf + (size_t)seg_blocks * seg_max * dim + (size_t)p * max_path * dim;
+    float* lens = seg_buf + (size_t)seg_blocks * seg_max * dim + (size_t)L.batch * max_path * dim
+                + (size_t)p * KM * KM;
+    for (int k = tid; k < PRRAX_CONS_SIZE; k += blockDim.x) cons_sh[k] = L.cons[p * PRRAX_CONS_SIZE + k];
+    if (tid == 0) {
+        zero_sh = 0;
+        len_sh = path_len[p];
+        go_sh = L.solved[p] == 1 && len_sh > 2 && ((phase != 3 && phase != 4) || sub == 0);
+        const float* c = L.counts + p * 4;
+        ctx_sh.world_spheres = L.w_sph + (size_t)p * L.max_w[0] * 4;
+        ctx_sh.world_capsules = L.w_cap + (size_t)p * L.max_w[1] * 7;
+        ctx_sh.world_boxes = L.w_box + (size_t)p * L.max_w[2] * 15;
+        ctx_sh.world_halfspaces = L.w_hs + (size_t)p * L.max_w[3] * 6;
+        ctx_sh.n_world_spheres = static_cast<int>(c[0]);
+        ctx_sh.n_world_capsules = static_cast<int>(c[1]);
+        ctx_sh.n_world_boxes = static_cast<int>(c[2]);
+        ctx_sh.n_world_halfspaces = static_cast<int>(c[3]);
+        ctx_sh.enabled = (prrax::n_spheres > 0 &&
+            (c[0] > 0.f || c[1] > 0.f || c[2] > 0.f || c[3] > 0.f || prrax::n_self_pairs > 0)) ? 1 : 0;
+        ctx_sh.collision_mode = collision_mode;
+        ctx_sh.collision_margin = collision_margin;
+        ctx_sh.solved = &zero_sh;   // never aborts: the problem is already solved
+    }
+    __syncthreads();
+    if (!go_sh) return;   // block-uniform
+    const CollisionContext& ctx = ctx_sh;
+    const bool constrained = cons_sh[CONS_N] > 0.0f;
+    const bool cc_coop = (collision_mode == 3 && prrax::coarse_enabled
+                          && grim::robot::n_frames <= PRRTC_CC_MAX_JOINTS
+                          && static_cast<int>(blockDim.x) >= PRRTC_CC_LANES);
+    const float eps = cons_sh[CONS_CONNECT_EPS];
+
+    auto dist = [&](const float* a, const float* b) {
+        float s2 = 0.f; for (int d = 0; d < dim; ++d) { const float x = a[d] - b[d]; s2 += x * x; }
+        return sqrtf(s2); };
+
+    // The planner's connect from a to b, steps of <= step_size: projected (constrained_extend) if
+    // `project`, else straight; every step's W waypoints collision-checked (chords from the
+    // previous waypoint). Collective. True if it reached b; the segment (b exact at its end) is
+    // S[0, nseg_sh). seed: the projection's perturbation stream (a repeat reproduces the segment).
+    auto connect_seg = [&](const float* a, const float* b, bool project, unsigned seed) -> bool {
+        if (tid == 0) {
+            nseg_sh = 0;
+            for (int d = 0; d < dim; ++d) { cur_sh[d] = a[d]; tgt_sh[d] = b[d]; }
+        }
+        __syncthreads();
+        bool reached = false;
+        for (int e = 0; e * W + W <= seg_max; ++e) {
+            const float d_curr = prrax_cons::sq_dist(cur_sh, tgt_sh);
+            if (project) {
+                if (d_curr < eps * eps) { reached = true; break; }
+                if (!prrax_cons::constrained_extend(cons_sh, cur_sh, tgt_sh, step_size, lo, hi, wp_sh,
+                                                    &cflag_sh, p, seed * 64u + e, &zero_sh) ||
+                    prrax_cons::sq_dist(wp_sh + (W - 1) * CONFIG_DIM_MAX, tgt_sh) >= d_curr) break;
+            } else {
+                if (d_curr < 1e-12f) { reached = true; break; }
+                const float f = fminf(1.0f, step_size / sqrtf(d_curr));
+                // The last step ends exactly on the target (rounding would miss the 1e-12 test).
+                if (tid < W)
+                    for (int d = 0; d < dim; ++d)
+                        wp_sh[tid * CONFIG_DIM_MAX + d] = (f == 1.0f && tid == W - 1) ? tgt_sh[d] :
+                            cur_sh[d] + f * (static_cast<float>(tid + 1) / W) * (tgt_sh[d] - cur_sh[d]);
+                __syncthreads();
+            }
+            if (tid == 0) any_sh = 0;
+            __syncthreads();
+            if (cc_coop) {
+                prrtc_edge_cc_cooperative(cur_sh, cur_sh, dim, W, ctx, cc_group_T, &any_sh, wp_sh,
+                                          constrained ? cons_sh : nullptr, lo, hi);
+            } else {
+                const int slot = tid % W;
+                const float* prev = slot == 0 ? cur_sh : wp_sh + (slot - 1) * CONFIG_DIM_MAX;
+                if (prrtc_gap_invalid(prev, wp_sh + slot * CONFIG_DIM_MAX, dim, ctx, tid / W,
+                                      constrained ? cons_sh : nullptr, lo, hi)) atomicOr(&any_sh, 1);
+            }
+            __syncthreads();
+            if (any_sh) break;
+            if (tid < W)
+                for (int d = 0; d < dim; ++d) S[(nseg_sh + tid) * dim + d] = wp_sh[tid * CONFIG_DIM_MAX + d];
+            __syncthreads();
+            if (tid == 0) {
+                nseg_sh += W;
+                for (int d = 0; d < dim; ++d) cur_sh[d] = wp_sh[(W - 1) * CONFIG_DIM_MAX + d];
+            }
+            __syncthreads();
+        }
+        if (!project && !reached) reached = prrax_cons::sq_dist(cur_sh, tgt_sh) < 1e-12f;
+        if (reached && tid == 0 && nseg_sh > 0)
+            for (int d = 0; d < dim; ++d) S[(nseg_sh - 1) * dim + d] = b[d];
+        __syncthreads();
+        return reached;
+    };
+
+    const int n = len_sh;
+    const int K = min(n, KM);
+    auto anchor = [&](int k) { return static_cast<int>((static_cast<long long>(k) * (n - 1)) / (K - 1)); };
+    auto sub_len = [&](int a, int b) { float l = 0.f; for (int m = a; m < b; ++m) l += dist(P + m * dim, P + (m + 1) * dim); return l; };
+
+    if (phase <= 1) {   // --- B-spline smoothing of the waypoints of one parity ---
+        for (int i = 1 + phase + 2 * sub; i + 1 < n; i += 2 * nb) {
+            const float *a = P + (i - 1) * dim, *b = P + i * dim, *c = P + (i + 1) * dim;
+            if (tid == 0) {
+                for (int d = 0; d < dim; ++d) mid_sh[d] = 0.25f * a[d] + 0.5f * b[d] + 0.25f * c[d];
+                cflag_sh = dist(mid_sh, b) >= PRRAX_BSPLINE_MIN_CHANGE
+                        && (!constrained || prrax_cons::tsr_project(cons_sh, mid_sh, lo, hi))
+                        && dist(a, mid_sh) + dist(mid_sh, c) < dist(a, b) + dist(b, c);
+            }
+            __syncthreads();
+            if (!cflag_sh) continue;
+            // The chords a -> mid -> c are what the path interpolates (constrained: between
+            // dense projected waypoints, as in a tree edge).
+            if (!connect_seg(a, mid_sh, false, 0) || !connect_seg(mid_sh, c, false, 0)) continue;
+            if (tid < dim) P[i * dim + tid] = mid_sh[tid];
+            __syncthreads();
+        }
+        return;
+    }
+
+    if (phase == 2 || phase == 4) {   // --- shortcut graph edges ---
+        // Phase 4 (first, block 0) tries the whole path; if that connects, the other pairs are
+        // left out (phase 2 then only marks them).
+        const bool whole = phase == 2 && lens[K - 1] < FLT_MAX;
+        for (int q = phase == 4 ? K - 1 : sub; q < (phase == 4 ? K : K * K); q += nb) {
+            const int k = q / K, l = q % K;
+            if (l < k + 2 || (phase == 2 && q == K - 1)) continue;
+            if (whole) { if (tid == 0) lens[k * KM + l] = FLT_MAX; continue; }
+            const int ia = anchor(k), ib = anchor(l);
+            const float *a = P + ia * dim, *b = P + ib * dim;
+            // A shortcut is at least its chord long: skip it if that cannot beat the path.
+            float len = FLT_MAX;
+            if (dist(a, b) < sub_len(ia, ib) && connect_seg(a, b, constrained, k * KM + l)) {
+                len = dist(a, S);
+                for (int m = 0; m + 1 < nseg_sh; ++m) len += dist(S + m * dim, S + (m + 1) * dim);
+            }
+            if (tid == 0) lens[k * KM + l] = len;
+        }
+        return;
+    }
+
+    // --- phase 3: shortest path over the anchors, path rebuilt into Q ---
+    __shared__ int parent_sh[KM], chain_sh[KM], n_chain_sh, q_len_sh;
+    __shared__ float dp_sh[KM];
+    if (tid == 0) {
+        for (int l = 0; l < K; ++l) { dp_sh[l] = l == 0 ? 0.f : FLT_MAX; parent_sh[l] = -1; }
+        for (int k = 0; k + 1 < K; ++k) {
+            const float orig = dp_sh[k] + sub_len(anchor(k), anchor(k + 1));
+            if (orig < dp_sh[k + 1]) { dp_sh[k + 1] = orig; parent_sh[k + 1] = k; }
+            for (int l = k + 2; l < K; ++l) {
+                const float c = lens[k * KM + l];
+                if (c < FLT_MAX && dp_sh[k] + c < dp_sh[l]) { dp_sh[l] = dp_sh[k] + c; parent_sh[l] = k; }
+            }
+        }
+        int c = 0;
+        for (int k = K - 1; k >= 0; k = parent_sh[k]) chain_sh[c++] = k;
+        n_chain_sh = c;
+        q_len_sh = 1;
+        for (int d = 0; d < dim; ++d) Q[d] = P[d];
+    }
+    __syncthreads();
+    for (int c = n_chain_sh - 1; c > 0; --c) {
+        const int k = chain_sh[c], l = chain_sh[c - 1];
+        const int ia = anchor(k), ib = anchor(l);
+        bool shortcut = l > k + 1;
+        if (shortcut && constrained)   // the projected segment again (same seed)
+            shortcut = connect_seg(P + ia * dim, P + ib * dim, true, k * KM + l);
+        if (tid == 0) {
+            // straight shortcut: just its end; constrained: its segment; else the sub-path
+            const float* src = shortcut ? (constrained ? S : P + ib * dim) : P + (ia + 1) * dim;
+            const int m = shortcut ? (constrained ? nseg_sh : 1) : ib - ia;
+            if (q_len_sh + m <= max_path) {
+                for (int x = 0; x < m * dim; ++x) Q[q_len_sh * dim + x] = src[x];
+                q_len_sh += m;
+            } else {
+                q_len_sh = -1;   // does not fit: keep the old path
+            }
+        }
+        __syncthreads();
+        if (q_len_sh < 0) break;
+    }
+    if (q_len_sh > 0) {
+        for (int x = tid; x < q_len_sh * dim; x += blockDim.x) P[x] = Q[x];
+        if (tid == 0) path_len[p] = q_len_sh;
+    }
+}
+
 // Scratch kept across calls (grow-only): dynamic-domain radii and per-problem counters.
 // ponytail: one process-wide pool, not thread-safe; a mutex or per-device pools if the handler
 // ever runs concurrently.
@@ -1302,6 +1697,8 @@ struct PlannerPool {
     int* ints = nullptr;                      // work, active [2, batch]
     unsigned long long* times = nullptr;      // t_start, t_end [2, batch]
     int batch_cap = 0;
+    float* seg = nullptr;                     // shortcut segments [batch, seg_max, dim]
+    size_t seg_size = 0;
     int grid_cap = 0;                         // resident blocks of the planner kernel (whole GPU)
     int grid_threads = -1;
     cudaError_t reserve(int batch, size_t n_radii, int threads) {
@@ -1331,6 +1728,14 @@ struct PlannerPool {
         }
         return cudaSuccess;
     }
+    cudaError_t reserve_seg(size_t n) {
+        if (n <= seg_size) return cudaSuccess;
+        cudaFree(seg);
+        seg_size = 0;
+        const cudaError_t e = cudaMalloc(&seg, sizeof(float) * n);
+        if (e == cudaSuccess) seg_size = n;
+        return e;
+    }
 };
 static PlannerPool g_pool;
 
@@ -1341,7 +1746,8 @@ static ffi::Error PrrtcPlannerImpl(
     // All inputs in one buffer (one host->device copy), in this order: starts [batch, dim],
     // goals [batch, num_goals, dim], min_vals [dim], max_vals [dim], world spheres
     // [batch, mw0, 4], capsules [batch, mw1, 7], boxes [batch, mw2, 15], halfspaces
-    // [batch, mw3, 6], world counts [batch, 4], constraints [batch, PRRAX_CONS_SIZE].
+    // [batch, mw3, 6], world counts [batch, 4], constraints [batch, PRRAX_CONS_SIZE],
+    // AO-x cost bounds [batch].
     ffi::Buffer<ffi::DataType::F32> inputs,
     ffi::Result<ffi::Buffer<ffi::DataType::F32>> tree_a_configs,   // [batch, dim, max_nodes]
     ffi::Result<ffi::Buffer<ffi::DataType::F32>> tree_b_configs,   // [batch, dim, max_nodes]
@@ -1370,6 +1776,7 @@ static ffi::Error PrrtcPlannerImpl(
     int granularity,
     int collision_mode,
     float collision_margin,
+    int shortcut_rounds,
     int batch, int dim, int num_goals, int mw0, int mw1, int mw2, int mw3
 ) {
     const float* in = inputs.typed_data();
@@ -1382,21 +1789,23 @@ static ffi::Error PrrtcPlannerImpl(
     const float* w_box = in;                     in += (size_t)batch * mw2 * 15;
     const float* w_hs = in;                      in += (size_t)batch * mw3 * 6;
     const float* counts_in = in;                 in += (size_t)batch * 4;
-    const float* cons_in = in;
+    const float* cons_in = in;                   in += (size_t)batch * PRRAX_CONS_SIZE;
+    const float* best_in = in;                   // [batch] AO-x cost bound (FLT_MAX: any path, < 0: skip)
     const size_t wps_size = static_cast<size_t>(edge_wps_a->dimensions()[1]);
     const int max_path = static_cast<int>(path->dimensions()[1]);
-    cudaError_t e = g_pool.reserve(batch, (size_t)2 * batch * max_nodes, granularity * PRRAX_WP_LANES);
+    cudaError_t e = g_pool.reserve(batch, (size_t)4 * batch * max_nodes, granularity * PRRAX_WP_LANES);
     if (e != cudaSuccess) return ffi::Error(ffi::ErrorCode::kInternal, cudaGetErrorString(e));
 
     BatchLayout L;
     L.ta_cfg = tree_a_configs->typed_data(); L.tb_cfg = tree_b_configs->typed_data();
     L.wps_a = edge_wps_a->typed_data(); L.wps_b = edge_wps_b->typed_data(); L.radii = g_pool.radii;
+    L.cost = g_pool.radii + (size_t)2 * batch * max_nodes;
     L.ta_par = tree_a_parents->typed_data(); L.tb_par = tree_b_parents->typed_data();
     L.sizes = tree_sizes->typed_data(); L.completed = completed->typed_data();
     L.iters = iter_count->typed_data(); L.conn = connection_info->typed_data(); L.solved = solved_flag->typed_data();
     L.work = g_pool.ints; L.active = g_pool.ints + batch;
     L.t_start = g_pool.times; L.t_end = g_pool.times + batch;
-    L.starts = starts_in; L.goals = goals_in; L.cons = cons_in;
+    L.starts = starts_in; L.goals = goals_in; L.cons = cons_in; L.best = best_in;
     L.w_sph = w_sph; L.w_cap = w_cap; L.w_box = w_box; L.w_hs = w_hs;
     L.counts = counts_in;
     L.batch = batch; L.dim = dim; L.num_goals = num_goals; L.max_nodes = max_nodes; L.wps_size = wps_size;
@@ -1414,6 +1823,28 @@ static ffi::Error PrrtcPlannerImpl(
     prrax_path_batch_kernel<<<batch, 32, 0, stream>>>(L, path->typed_data(), path_len->typed_data(),
                                                        kernel_time_ms->typed_data(),
                                                        (wps_size > 1) ? granularity - 1 : 0, max_path);
+    if (shortcut_rounds > 0) {
+        const int seg_max = 16 * granularity;   // up to 16 steps of granularity waypoints
+        // Blocks per problem: enough to fill the GPU (the shortcut graph has up to K^2/2 pairs).
+        const int nb = std::max(1, g_pool.grid_cap / batch);
+        const int grid = batch * nb;
+        e = g_pool.reserve_seg((size_t)grid * seg_max * dim + (size_t)batch * max_path * dim
+                               + (size_t)batch * PRRAX_SC_ANCHORS * PRRAX_SC_ANCHORS);
+        if (e != cudaSuccess) return ffi::Error(ffi::ErrorCode::kInternal, cudaGetErrorString(e));
+        auto launch = [&](int phase, int g) {
+            prrax_shortcut_batch_kernel<<<g, granularity * PRRAX_WP_LANES, 0, stream>>>(
+                L, path->typed_data(), path_len->typed_data(), min_in, max_in, collision_mode,
+                collision_margin, step_size, phase, max_path, g_pool.seg, seg_max, grid);
+        };
+        // Shortcuts first (MR. POP smooths first): smoothing then only checks the few
+        // waypoints left, at the same final cost per round.
+        for (int r = 0; r < shortcut_rounds; ++r) {
+            launch(4, batch);
+            launch(2, grid);
+            launch(3, batch);
+            for (int step = 0; step < PRRAX_BSPLINE_STEPS; ++step) { launch(0, grid); launch(1, grid); }
+        }
+    }
     e = cudaGetLastError();
     if (e != cudaSuccess) return ffi::Error(ffi::ErrorCode::kInternal, cudaGetErrorString(e));
     return ffi::Error::Success();
@@ -1451,6 +1882,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Attr<int>("granularity")
         .Attr<int>("collision_mode")
         .Attr<float>("collision_margin")
+        .Attr<int>("shortcut_rounds")
         .Attr<int>("batch")
         .Attr<int>("dim")
         .Attr<int>("num_goals")
@@ -1526,4 +1958,139 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Ret<ffi::Buffer<ffi::DataType::F32>>()   // err2 [B]
         .Ret<ffi::Buffer<ffi::DataType::F32>>()   // q_proj [B, dim]
         .Ret<ffi::Buffer<ffi::DataType::S32>>()   // ok [B]
+);
+
+// Per-configuration collision verdicts of this build's checker (the planner's exact model:
+// baked spheres + self pairs, per-call world), so callers can compare it against other
+// checkers. One thread per configuration; binary (mode 0) or coarse (mode 2).
+__device__ int g_never_solved = 0;
+__global__ void prrax_cc_kernel(const float* __restrict__ q, const float* __restrict__ w_sph,
+                                const float* __restrict__ w_cap, const float* __restrict__ w_box,
+                                const float* __restrict__ w_hs, const float* __restrict__ counts,
+                                int* __restrict__ hit, int batch, int dim, int mode) {
+    const int b = blockIdx.x * blockDim.x + threadIdx.x;
+    if (b >= batch) return;
+    CollisionContext ctx;
+    ctx.world_spheres = w_sph; ctx.world_capsules = w_cap; ctx.world_boxes = w_box; ctx.world_halfspaces = w_hs;
+    ctx.n_world_spheres = static_cast<int>(counts[0]); ctx.n_world_capsules = static_cast<int>(counts[1]);
+    ctx.n_world_boxes = static_cast<int>(counts[2]); ctx.n_world_halfspaces = static_cast<int>(counts[3]);
+    ctx.enabled = (prrax::n_spheres > 0 && (counts[0] > 0.f || counts[1] > 0.f || counts[2] > 0.f ||
+                   counts[3] > 0.f || prrax::n_self_pairs > 0)) ? 1 : 0;
+    ctx.collision_mode = mode; ctx.collision_margin = 0.f; ctx.solved = &g_never_solved;
+    float x[CONFIG_DIM_MAX];
+    for (int k = 0; k < dim; ++k) x[k] = q[b * dim + k];
+    hit[b] = prrtc_config_in_collision(x, ctx) ? 1 : 0;
+}
+
+static ffi::Error PrraxCcImpl(cudaStream_t stream, ffi::Buffer<ffi::DataType::F32> q,
+                              ffi::Buffer<ffi::DataType::F32> w_sph, ffi::Buffer<ffi::DataType::F32> w_cap,
+                              ffi::Buffer<ffi::DataType::F32> w_box, ffi::Buffer<ffi::DataType::F32> w_hs,
+                              ffi::Buffer<ffi::DataType::F32> counts,
+                              ffi::Result<ffi::Buffer<ffi::DataType::S32>> hit, int mode) {
+    const int batch = static_cast<int>(q.dimensions()[0]);
+    const int dim = static_cast<int>(q.dimensions()[1]);
+    prrax_cc_kernel<<<(batch + 63) / 64, 64, 0, stream>>>(
+        q.typed_data(), w_sph.typed_data(), w_cap.typed_data(), w_box.typed_data(), w_hs.typed_data(),
+        counts.typed_data(), hit->typed_data(), batch, dim, mode);
+    const cudaError_t e = cudaGetLastError();
+    return e == cudaSuccess ? ffi::Error::Success() : ffi::Error(ffi::ErrorCode::kInternal, cudaGetErrorString(e));
+}
+
+XLA_FFI_DEFINE_HANDLER_SYMBOL(
+    PrraxCcFfi, PrraxCcImpl,
+    ffi::Ffi::Bind()
+        .Ctx<ffi::PlatformStream<cudaStream_t>>()
+        .Arg<ffi::Buffer<ffi::DataType::F32>>()   // q [B, dim]
+        .Arg<ffi::Buffer<ffi::DataType::F32>>()   // world spheres [1, mw0, 4]
+        .Arg<ffi::Buffer<ffi::DataType::F32>>()   // capsules [1, mw1, 7]
+        .Arg<ffi::Buffer<ffi::DataType::F32>>()   // boxes [1, mw2, 15]
+        .Arg<ffi::Buffer<ffi::DataType::F32>>()   // halfspaces [1, mw3, 6]
+        .Arg<ffi::Buffer<ffi::DataType::F32>>()   // counts [1, 4]
+        .Ret<ffi::Buffer<ffi::DataType::S32>>()   // hit [B]
+        .Attr<int>("mode")
+);
+
+// MR. POP simplification of caller-supplied paths (e.g. a path stitched from many planner
+// calls), with exactly the schedule PrrtcPlannerImpl runs on its own traced path: per round,
+// the shortcut graph (phases 4, 2, 3) then PRRAX_BSPLINE_STEPS smoothing sweeps (0, 1).
+__global__ void prrax_fill_int_kernel(int* x, int n, int v) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) x[i] = v;
+}
+
+static ffi::Error PrraxSimplifyImpl(
+    cudaStream_t stream,
+    // packed inputs: min_vals [dim], max_vals [dim], world spheres [batch, mw0, 4], capsules
+    // [batch, mw1, 7], boxes [batch, mw2, 15], halfspaces [batch, mw3, 6], counts [batch, 4],
+    // constraints [batch, PRRAX_CONS_SIZE]
+    ffi::Buffer<ffi::DataType::F32> inputs,
+    ffi::Buffer<ffi::DataType::F32> path_in,      // [batch, max_path, dim]
+    ffi::Buffer<ffi::DataType::S32> len_in,       // [batch]
+    ffi::Result<ffi::Buffer<ffi::DataType::F32>> path,
+    ffi::Result<ffi::Buffer<ffi::DataType::S32>> path_len,
+    int rounds, float step_size, int granularity, int collision_mode, float collision_margin,
+    int batch, int dim, int mw0, int mw1, int mw2, int mw3)
+{
+    const float* in = inputs.typed_data();
+    const float* min_in = in;            in += dim;
+    const float* max_in = in;            in += dim;
+    const float* w_sph = in;             in += (size_t)batch * mw0 * 4;
+    const float* w_cap = in;             in += (size_t)batch * mw1 * 7;
+    const float* w_box = in;             in += (size_t)batch * mw2 * 15;
+    const float* w_hs = in;              in += (size_t)batch * mw3 * 6;
+    const float* counts_in = in;         in += (size_t)batch * 4;
+    const float* cons_in = in;
+    const int max_path = static_cast<int>(path->dimensions()[1]);
+    cudaMemcpyAsync(path->typed_data(), path_in.typed_data(), sizeof(float) * (size_t)batch * max_path * dim,
+                    cudaMemcpyDeviceToDevice, stream);
+    cudaMemcpyAsync(path_len->typed_data(), len_in.typed_data(), sizeof(int) * batch, cudaMemcpyDeviceToDevice, stream);
+    cudaError_t e = g_pool.reserve(batch, 1, granularity * PRRAX_WP_LANES);
+    if (e != cudaSuccess) return ffi::Error(ffi::ErrorCode::kInternal, cudaGetErrorString(e));
+    BatchLayout L{};
+    L.solved = g_pool.ints;                              // every problem "solved"
+    prrax_fill_int_kernel<<<(batch + 255) / 256, 256, 0, stream>>>(L.solved, batch, 1);
+    L.cons = cons_in; L.w_sph = w_sph; L.w_cap = w_cap; L.w_box = w_box; L.w_hs = w_hs; L.counts = counts_in;
+    L.batch = batch; L.dim = dim;
+    L.max_w[0] = mw0; L.max_w[1] = mw1; L.max_w[2] = mw2; L.max_w[3] = mw3;
+    const int seg_max = 16 * granularity;
+    const int nb = std::max(1, g_pool.grid_cap / batch);
+    const int grid = batch * nb;
+    e = g_pool.reserve_seg((size_t)grid * seg_max * dim + (size_t)batch * max_path * dim
+                           + (size_t)batch * PRRAX_SC_ANCHORS * PRRAX_SC_ANCHORS);
+    if (e != cudaSuccess) return ffi::Error(ffi::ErrorCode::kInternal, cudaGetErrorString(e));
+    auto launch = [&](int phase, int g) {
+        prrax_shortcut_batch_kernel<<<g, granularity * PRRAX_WP_LANES, 0, stream>>>(
+            L, path->typed_data(), path_len->typed_data(), min_in, max_in, collision_mode,
+            collision_margin, step_size, phase, max_path, g_pool.seg, seg_max, grid);
+    };
+    for (int r = 0; r < rounds; ++r) {
+        launch(4, batch);
+        launch(2, grid);
+        launch(3, batch);
+        for (int step = 0; step < PRRAX_BSPLINE_STEPS; ++step) { launch(0, grid); launch(1, grid); }
+    }
+    e = cudaGetLastError();
+    return e == cudaSuccess ? ffi::Error::Success() : ffi::Error(ffi::ErrorCode::kInternal, cudaGetErrorString(e));
+}
+
+XLA_FFI_DEFINE_HANDLER_SYMBOL(
+    PrraxSimplifyFfi, PrraxSimplifyImpl,
+    ffi::Ffi::Bind()
+        .Ctx<ffi::PlatformStream<cudaStream_t>>()
+        .Arg<ffi::Buffer<ffi::DataType::F32>>()   // packed inputs
+        .Arg<ffi::Buffer<ffi::DataType::F32>>()   // path_in [batch, max_path, dim]
+        .Arg<ffi::Buffer<ffi::DataType::S32>>()   // len_in [batch]
+        .Ret<ffi::Buffer<ffi::DataType::F32>>()   // path
+        .Ret<ffi::Buffer<ffi::DataType::S32>>()   // path_len
+        .Attr<int>("rounds")
+        .Attr<float>("step_size")
+        .Attr<int>("granularity")
+        .Attr<int>("collision_mode")
+        .Attr<float>("collision_margin")
+        .Attr<int>("batch")
+        .Attr<int>("dim")
+        .Attr<int>("mw0")
+        .Attr<int>("mw1")
+        .Attr<int>("mw2")
+        .Attr<int>("mw3")
 );

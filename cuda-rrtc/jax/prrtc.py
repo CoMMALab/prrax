@@ -179,6 +179,20 @@ def constraint_error(collision_context, constraints: list[TSRConstraint], q,
     return np.sqrt(err2), q_proj, ok.astype(bool)
 
 
+def config_in_collision(collision_context, q, constraints: list[TSRConstraint] = (),
+                        collision_checker: str = "binary"):
+    """``(B,)`` bool: the planner build's own collision verdict at configurations ``q`` (B, dim)
+    -- the exact model the planner checks edges with. ``constraints`` only selects the build
+    (pass the planner's, so no second build compiles)."""
+    ee = tuple(sorted({c.ee_joint for c in constraints}))
+    name = _planner_targets(collision_context, ee)[3]
+    q = np.atleast_2d(np.asarray(q, np.float32))
+    worlds = _pack_worlds([collision_context])
+    hit = jax.ffi.ffi_call(name, jax.ShapeDtypeStruct((q.shape[0],), jnp.int32))(
+        q, *worlds[:4], worlds[4].astype(np.float32), mode=np.int32(_resolve_collision_mode(collision_checker)))
+    return np.asarray(hit).astype(bool)
+
+
 @lru_cache(maxsize=64)
 def _tsr_call(name: str, shape: tuple[int, int]):
     return jax.jit(jax.ffi.ffi_call(name, (
@@ -251,7 +265,8 @@ def _solve(
     start_configs, goal_configs, contexts, *, max_iterations, step_size, num_new_samples,
     granularity, max_nodes, balance_mode, tree_ratio, dynamic_domain, dd_alpha, dd_radius,
     dd_min_radius, min_vals, max_vals, jit_trace, collision_checker, collision_margin,
-    constraints, projection, return_trees=False, max_path_points=8192,
+    constraints, projection, return_trees=False, max_path_points=8192, ao_passes=0,
+    cost_bound=None, shortcut_rounds=0,
 ) -> list[PRRTCResult]:
     collision_mode = _resolve_collision_mode(collision_checker)
     if any(c is None for c in contexts):
@@ -288,62 +303,81 @@ def _solve(
         tree_ratio=float(tree_ratio), dynamic_domain=int(bool(dynamic_domain)),
         dd_alpha=float(dd_alpha), dd_radius=float(dd_radius), dd_min_radius=float(dd_min_radius),
         granularity=int(granularity), collision_mode=collision_mode,
-        collision_margin=float(collision_margin),
+        collision_margin=float(collision_margin), shortcut_rounds=int(shortcut_rounds),
         num_goals=int(goal_configs.shape[1]), mw0=worlds[0].shape[1], mw1=worlds[1].shape[1],
         mw2=worlds[2].shape[1], mw3=worlds[3].shape[1],
     )
-    # One host->device copy: every input in one float32 buffer (layout: PrrtcPlannerImpl).
-    raw = call(np.concatenate([a.astype(np.float32, copy=False).ravel() for a in (
-        start_configs, goal_configs, min_vals, max_vals, *worlds, packed)]))
-    # Only the small outputs and the traced path leave the device (trees on request), in one
-    # transfer for small batches (whole path buffers), per problem for large ones.
-    small = (raw[4], raw[6], raw[7], raw[8], raw[9], raw[13])
-    if batch <= 16:
-        sizes, iters, conn, solved_flags, ktimes, plen, paths = jax.device_get(small + (raw[12],))
-    else:
-        (sizes, iters, conn, solved_flags, ktimes, plen), paths = jax.device_get(small), None
+    # AO-x (MR. POP / pAORRTC): pass 0 finds any path; each further pass replans from scratch
+    # for a path cheaper than the best so far (informed sampling, cost-bounded trees). A
+    # problem that is unsolved, or not improved in a pass, keeps its best result.
+    def run(best):
+        # One host->device copy: every input in one float32 buffer (layout: PrrtcPlannerImpl).
+        raw = call(np.concatenate([a.astype(np.float32, copy=False).ravel() for a in (
+            start_configs, goal_configs, min_vals, max_vals, *worlds, packed, best)]))
+        # Only the small outputs and the traced path leave the device (trees on request), in one
+        # transfer for small batches (whole path buffers), per problem for large ones.
+        small = (raw[4], raw[6], raw[7], raw[8], raw[9], raw[13])
+        if batch <= 16:
+            sizes, iters, conn, solved_flags, ktimes, plen, paths = jax.device_get(small + (raw[12],))
+        else:
+            (sizes, iters, conn, solved_flags, ktimes, plen), paths = jax.device_get(small), None
 
-    results = []
-    for i in range(batch):
-        size_a, size_b = (int(x) for x in sizes[i])
-        solved = bool(solved_flags[i][0] == 1)
-        trees = (None,) * 4
-        if return_trees or (solved and plen[i] < 0):
-            # Slices of power-of-two length: a few compiled shapes, not one per tree size.
-            na, nb = (min(1 << max(n - 1, 0).bit_length(), max_nodes) for n in (size_a, size_b))
-            ta_cfg, tb_cfg, ta_par, tb_par = jax.device_get(_take_trees(na, nb)(*raw[:4], i))
-            trees = (ta_cfg[:, :size_a], tb_cfg[:, :size_b], ta_par[:size_a], tb_par[:size_b])
-        path = None
-        if solved and plen[i] > 0:
-            n = int(plen[i])
-            path = (paths[i, :n] if paths is not None
-                    else np.asarray(_take_path(1 << (n - 1).bit_length())(raw[12], i))[:n])
-        elif solved:   # longer than the path buffer: trace it on the host
-            ta_cfg, tb_cfg, ta_par, tb_par = trees
-            nodes_a, nodes_b = _path_nodes(ta_par, tb_par, conn[i])
-            path_a, path_b = ta_cfg[:, nodes_a].T, tb_cfg[:, nodes_b].T
-            if constraints[i]:   # expand each edge's projected interior waypoints
-                W1 = int(granularity) - 1
-                wa, wb = (np.asarray(_take_wps(len(n), W1, dim)(raw[k], i, np.asarray(n, np.int32)))
-                          for k, n in ((10, nodes_a), (11, nodes_b)))
-                path_a = np.concatenate([path_a[:1]] + [np.concatenate((wa[j], path_a[j:j + 1]))
-                                                        for j in range(1, len(nodes_a))])
-                path_b = np.concatenate([np.concatenate((path_b[j:j + 1], wb[j][::-1]))
-                                         for j in range(len(nodes_b) - 1)] + [path_b[-1:]])
-            path = np.concatenate((path_a, path_b))
-        results.append(PRRTCResult(
-            solved=solved,
-            path=path,
-            tree_a_size=size_a,
-            tree_b_size=size_b,
-            iterations=int(iters[i][0]),
-            cost=float(np.sum(np.linalg.norm(np.diff(path, axis=0), axis=1))) if solved else float("inf"),
-            kernel_time_ms=float(ktimes[i]),   # GPU time of setup + root projection + planning
-            tree_a_configs=trees[0] if return_trees else None,
-            tree_b_configs=trees[1] if return_trees else None,
-            tree_a_parents=trees[2] if return_trees else None,
-            tree_b_parents=trees[3] if return_trees else None,
-        ))
+        results = []
+        for i in range(batch):
+            size_a, size_b = (int(x) for x in sizes[i])
+            solved = bool(solved_flags[i][0] == 1)
+            trees = (None,) * 4
+            if return_trees or (solved and plen[i] < 0):
+                # Slices of power-of-two length: a few compiled shapes, not one per tree size.
+                na, nb = (min(1 << max(n - 1, 0).bit_length(), max_nodes) for n in (size_a, size_b))
+                ta_cfg, tb_cfg, ta_par, tb_par = jax.device_get(_take_trees(na, nb)(*raw[:4], i))
+                trees = (ta_cfg[:, :size_a], tb_cfg[:, :size_b], ta_par[:size_a], tb_par[:size_b])
+            path = None
+            if solved and plen[i] > 0:
+                n = int(plen[i])
+                path = (paths[i, :n] if paths is not None
+                        else np.asarray(_take_path(1 << (n - 1).bit_length())(raw[12], i))[:n])
+            elif solved:   # longer than the path buffer: trace it on the host
+                ta_cfg, tb_cfg, ta_par, tb_par = trees
+                nodes_a, nodes_b = _path_nodes(ta_par, tb_par, conn[i])
+                path_a, path_b = ta_cfg[:, nodes_a].T, tb_cfg[:, nodes_b].T
+                if constraints[i]:   # expand each edge's projected interior waypoints
+                    W1 = int(granularity) - 1
+                    wa, wb = (np.asarray(_take_wps(len(n), W1, dim)(raw[k], i, np.asarray(n, np.int32)))
+                              for k, n in ((10, nodes_a), (11, nodes_b)))
+                    path_a = np.concatenate([path_a[:1]] + [np.concatenate((wa[j], path_a[j:j + 1]))
+                                                            for j in range(1, len(nodes_a))])
+                    path_b = np.concatenate([np.concatenate((path_b[j:j + 1], wb[j][::-1]))
+                                             for j in range(len(nodes_b) - 1)] + [path_b[-1:]])
+                path = np.concatenate((path_a, path_b))
+            results.append(PRRTCResult(
+                solved=solved,
+                path=path,
+                tree_a_size=size_a,
+                tree_b_size=size_b,
+                iterations=int(iters[i][0]),
+                cost=float(np.sum(np.linalg.norm(np.diff(path, axis=0), axis=1))) if solved else float("inf"),
+                kernel_time_ms=float(ktimes[i]),   # GPU time of setup + root projection + planning
+                tree_a_configs=trees[0] if return_trees else None,
+                tree_b_configs=trees[1] if return_trees else None,
+                tree_a_parents=trees[2] if return_trees else None,
+                tree_b_parents=trees[3] if return_trees else None,
+            ))
+        return results
+
+    # cost_bound: the first run is already cost-bounded (e.g. a bound shared from an outer
+    # planner's incumbent); a path is only returned if it is cheaper.
+    results = run(np.full(batch, np.finfo(np.float32).max if cost_bound is None else cost_bound,
+                          np.float32))
+    for _ in range(int(ao_passes)):
+        best = np.array([r.cost if r.solved else -1.0 for r in results], np.float32)
+        if (best < 0).all():
+            break
+        for i, r in enumerate(run(best)):
+            old = results[i]
+            t = (old.kernel_time_ms or 0.0) + (r.kernel_time_ms or 0.0)
+            results[i] = (r if r.solved and r.cost < old.cost else old)._replace(
+                kernel_time_ms=t, iterations=old.iterations + r.iterations)
     return results
 
 
@@ -370,6 +404,8 @@ def prrtc_plan(
     constraints: Sequence[TSRConstraint] = (),
     projection: ProjectionSettings = ProjectionSettings(),
     return_trees: bool = False,
+    ao_passes: int = 0,
+    shortcut_rounds: int = 0,
 ) -> PRRTCResult:
     """
     Plan a path using the parallel RRTC (pRRTC) algorithm.
@@ -402,6 +438,15 @@ def prrtc_plan(
         projection: Projection settings (``ProjectionSettings``).
         return_trees: Also return both trees (``tree_*_configs`` / ``tree_*_parents``), e.g. to
             visualize them; off by default (the path is traced on the GPU).
+        shortcut_rounds: MR. POP path-simplification rounds on the GPU before the path is
+            returned. Each round runs 3 sweeps of B-spline smoothing, then takes the shortest
+            path through the shortcut graph between up to 64 anchor waypoints. Every change is
+            validated by the planner's own connect (projected steps plus edge collision
+            checks). With ``ao_passes``, each pass simplifies its path, so the next pass is
+            bounded by the simplified cost.
+        ao_passes: AO-x optimizing passes after the first solution (MR. POP / pAORRTC): each
+            replans for a path cheaper than the best so far. ``kernel_time_ms`` and
+            ``iterations`` then sum over the passes.
 
     Returns:
         PRRTCResult (path from start root to a goal root when solved).
@@ -418,6 +463,8 @@ def prrtc_plan(
         min_vals=min_vals, max_vals=max_vals, jit_trace=jit_trace,
         collision_checker=collision_checker, collision_margin=collision_margin,
         constraints=[list(constraints)], projection=projection, return_trees=return_trees,
+        ao_passes=ao_passes,
+        shortcut_rounds=shortcut_rounds,
     )[0]
 
 
@@ -444,6 +491,9 @@ def prrtc_plan_batch(
     constraints: Sequence = (),
     projection: ProjectionSettings = ProjectionSettings(),
     return_trees: bool = False,
+    ao_passes: int = 0,
+    cost_bound: Optional[float] = None,
+    shortcut_rounds: int = 0,
 ) -> list[PRRTCResult]:
     """
     Plan paths for a batch of independent start/goal pairs in parallel on the GPU.
@@ -481,6 +531,9 @@ def prrtc_plan_batch(
         min_vals=min_vals, max_vals=max_vals, jit_trace=jit_trace,
         collision_checker=collision_checker, collision_margin=collision_margin,
         constraints=constraints, projection=projection, return_trees=return_trees,
+        ao_passes=ao_passes,
+        cost_bound=cost_bound,
+        shortcut_rounds=shortcut_rounds,
     )
 
 
@@ -517,3 +570,48 @@ def _take_wps(n: int, w1: int, dim: int):
     m = 1 << max(n - 1, 0).bit_length()
     f = _take_wps_jit(m, w1, dim)
     return lambda wps, i, nodes: f(wps, i, np.pad(nodes, (0, m - n)))[:n]
+
+
+
+def simplify_paths(paths, collision_context, constraints: Sequence = (), *, rounds: int = 1,
+                   projection: ProjectionSettings = ProjectionSettings(), min_vals=None, max_vals=None,
+                   step_size: float = 0.5, granularity: int = 16, collision_checker: str = "binary",
+                   collision_margin: float = 0.02, max_path_points: Optional[int] = None):
+    """MR. POP simplification (the ``shortcut_rounds`` pass) of caller-supplied paths.
+
+    ``paths``: list of ``(n_i, dim)`` arrays (None passed through), all in one world.
+    ``constraints``: one constraint list shared by every path. Each change is validated by the
+    planner's own connect, exactly as on a planner path. Returns the simplified list.
+    """
+    live = [i for i, p in enumerate(paths) if p is not None and len(p) > 2]
+    out = [None if p is None else np.asarray(p, np.float32) for p in paths]
+    if not live or rounds <= 0:
+        return out
+    cons = list(constraints)
+    ee = tuple(sorted({c.ee_joint for c in cons}))
+    name = _planner_targets(collision_context, ee)[4]
+    batch, dim = len(live), out[live[0]].shape[1]
+    n_max = max(len(out[i]) for i in live)
+    max_path = int(max_path_points or max(1024, 1 << (2 * n_max - 1).bit_length()))
+    P = np.zeros((batch, max_path, dim), np.float32)
+    for b, i in enumerate(live):
+        P[b, :len(out[i])] = out[i]
+    lens = np.array([len(out[i]) for i in live], np.int32)
+    lo = np.asarray(-np.pi * np.ones(dim) if min_vals is None else min_vals, np.float32)
+    hi = np.asarray(np.pi * np.ones(dim) if max_vals is None else max_vals, np.float32)
+    worlds = _pack_worlds([collision_context] * batch)
+    packed = np.stack([_pack_constraints(cons, ee, projection)] * batch)
+    inputs = np.concatenate([a.astype(np.float32, copy=False).ravel()
+                             for a in (lo, hi, *worlds, packed)])
+    f = jax.ffi.ffi_call(name, (jax.ShapeDtypeStruct((batch, max_path, dim), jnp.float32),
+                                jax.ShapeDtypeStruct((batch,), jnp.int32)))
+    Pn, ln = jax.device_get(f(inputs, P, lens, rounds=np.int32(rounds), step_size=np.float32(step_size),
+                              granularity=np.int32(granularity),
+                              collision_mode=np.int32(_resolve_collision_mode(collision_checker)),
+                              collision_margin=np.float32(collision_margin), batch=np.int32(batch),
+                              dim=np.int32(dim), mw0=np.int32(worlds[0].shape[1]),
+                              mw1=np.int32(worlds[1].shape[1]), mw2=np.int32(worlds[2].shape[1]),
+                              mw3=np.int32(worlds[3].shape[1])))
+    for b, i in enumerate(live):
+        out[i] = np.asarray(Pn[b, :int(ln[b])])
+    return out

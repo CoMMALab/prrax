@@ -96,6 +96,31 @@ waypoints become tree nodes, so the returned path lies on the manifold at waypoi
 `compare_mcvamp.py` compares against McVAMP's own results; `test_constrained.py` checks the
 constraint error, projection and paths against independent references.
 
+### Asymptotically Optimal Planning (AO-x)
+
+`ao_passes=k` (in `prrtc_plan` and `prrtc_plan_batch`, with or without constraints) adds k
+optimizing passes after the first solution. The design follows the AO-x layer of MR. POP and
+pAORRTC (Hauser & Zhou's AO-x meta-algorithm). Each pass replans from scratch for a path
+cheaper than the best so far:
+- samples come from the informed set (the prolate hyperspheroid between start and goal);
+- each sample gets a random cost budget;
+- nearest-neighbour search and connect only consider nodes that stay within that budget;
+- candidates that cannot beat the best path are pruned.
+
+The cheapest path is kept, and `kernel_time_ms` and `iterations` are summed over the passes.
+`shortcut_rounds=r` runs r rounds of MR. POP's path simplifier on the GPU before the path is
+returned. With `ao_passes`, each pass simplifies its path, so the next pass is bounded by the
+simplified cost. Each round has three steps:
+- try a direct shortcut from start to goal;
+- find the shortest path through the shortcut graph between up to 64 evenly spaced anchor
+  waypoints, checking all anchor pairs in parallel across the problem's blocks;
+- run 3 sweeps of B-spline smoothing.
+
+Every change is checked with the planner's own connect, using projected steps when the problem
+is constrained.
+
+`test_ao.py` checks both features.
+
 ### GPU Point-Cloud Planning (RoboGPU / OptiX)
 
 For dense environment point clouds (e.g. RealSense captures), the in-kernel

@@ -24,7 +24,7 @@ import numpy as np
 
 CUDA_DIR = Path(__file__).resolve().parent.parent / "CUDA"
 _SOURCE = CUDA_DIR / "prrtc_planner"
-SYMBOLS = ("PrrtcPlannerFfi", "PrraxFkFfi", "PrraxTsrFfi")
+SYMBOLS = ("PrrtcPlannerFfi", "PrraxFkFfi", "PrraxTsrFfi", "PrraxCcFfi", "PrraxSimplifyFfi")
 # Baked tables above this go to global memory: __constant__ is 64 KB per module.
 _CONSTANT_BYTES = 48 * 1024
 
