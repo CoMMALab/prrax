@@ -1083,6 +1083,8 @@ __device__ void plan_problem(
     // iteration count (all blocks) for reporting.
     int local_iter = 0;
     __shared__ int iters_sh;
+    __shared__ int direct_sh;
+    __shared__ float root_sh[CONFIG_DIM_MAX];
 
     while (true) {
         if (stopped()) return;
@@ -1092,6 +1094,7 @@ __device__ void plan_problem(
         ++local_iter;
         if (tid == 0) {
             const int w = atomicAdd(work, 1);
+            direct_sh = (w == 0);
             iters_sh = w / num_new_samples + 1;
             if (w >= max_iterations * num_new_samples) {
                 if (atomicCAS(solved_out, 0, -1) == 0) *t_end = globaltimer_ns();
@@ -1100,6 +1103,16 @@ __device__ void plan_problem(
         }
         __syncthreads();
         if (stopped()) return;
+
+        // --- Attempt 0: the direct connection start root -> goal tree (VAMP RRTC's
+        // connect_within(start, goal) before any sampling): the planner's own connect, projected
+        // steps + edge checks, so an easy problem gets a straight (projected) path. ---
+        if (direct_sh) {
+            if (tid < dim) root_sh[tid] = tree_a_configs[tid * max_nodes];
+            __syncthreads();
+            connect_from(0, 0, root_sh, 0.0f);
+            continue;
+        }
 
         // --- Sample one configuration and select tree side (tid == 0) ---
         if (tid == 0) {
@@ -1739,6 +1752,101 @@ struct PlannerPool {
 };
 static PlannerPool g_pool;
 
+// Device buffers and settings of one planner launch (see PrrtcPlannerImpl for the layout).
+struct PrraxPlanBuffers {
+    float *ta_cfg, *tb_cfg;                  // [batch, dim, max_nodes]
+    int *ta_par, *tb_par;                    // [batch, max_nodes]
+    int *sizes, *completed, *iters, *conn, *solved;
+    float *ktime, *wps_a, *wps_b;            // ktime [batch]; wps [batch, wps_size]
+    float *path; int *path_len;              // [batch, max_path, dim], [batch]
+    size_t wps_size; int max_path;
+};
+struct PrraxPlanSettings {
+    int max_iterations; float step_size; int num_new_samples; int balance_mode; float tree_ratio;
+    int dynamic_domain; float dd_alpha, dd_radius, dd_min_radius;
+    int max_nodes, granularity, collision_mode; float collision_margin; int shortcut_rounds;
+    int batch, dim, num_goals; int mw[4];
+};
+
+// The planner on raw device pointers: setup, persistent planning, path tracing and (optionally)
+// MR. POP simplification, all on `stream`; nothing blocks the host. `inputs` is the packed
+// buffer described at PrrtcPlannerImpl. Used by the FFI handler below and by callers that
+// launch the planner from their own handler (crispee's TSR anytime GTMP).
+static cudaError_t prrax_plan_raw(cudaStream_t stream, const float* inputs, const PrraxPlanBuffers& B,
+                                  const PrraxPlanSettings& S) {
+    const float* in = inputs;
+    const int batch = S.batch, dim = S.dim, num_goals = S.num_goals, max_nodes = S.max_nodes;
+    const int granularity = S.granularity, collision_mode = S.collision_mode;
+    const float collision_margin = S.collision_margin, step_size = S.step_size;
+    const int mw0 = S.mw[0], mw1 = S.mw[1], mw2 = S.mw[2], mw3 = S.mw[3];
+    const float* starts_in = in;                 in += (size_t)batch * dim;
+    const float* goals_in = in;                  in += (size_t)batch * num_goals * dim;
+    const float* min_in = in;                    in += dim;
+    const float* max_in = in;                    in += dim;
+    const float* w_sph = in;                     in += (size_t)batch * mw0 * 4;
+    const float* w_cap = in;                     in += (size_t)batch * mw1 * 7;
+    const float* w_box = in;                     in += (size_t)batch * mw2 * 15;
+    const float* w_hs = in;                      in += (size_t)batch * mw3 * 6;
+    const float* counts_in = in;                 in += (size_t)batch * 4;
+    const float* cons_in = in;                   in += (size_t)batch * PRRAX_CONS_SIZE;
+    const float* best_in = in;                   // [batch] AO-x cost bound (FLT_MAX: any path, < 0: skip)
+    const size_t wps_size = B.wps_size;
+    const int max_path = B.max_path;
+    cudaError_t e = g_pool.reserve(batch, (size_t)4 * batch * max_nodes, granularity * PRRAX_WP_LANES);
+    if (e != cudaSuccess) return e;
+
+    BatchLayout L;
+    L.ta_cfg = B.ta_cfg; L.tb_cfg = B.tb_cfg;
+    L.wps_a = B.wps_a; L.wps_b = B.wps_b; L.radii = g_pool.radii;
+    L.cost = g_pool.radii + (size_t)2 * batch * max_nodes;
+    L.ta_par = B.ta_par; L.tb_par = B.tb_par;
+    L.sizes = B.sizes; L.completed = B.completed;
+    L.iters = B.iters; L.conn = B.conn; L.solved = B.solved;
+    L.work = g_pool.ints; L.active = g_pool.ints + batch;
+    L.t_start = g_pool.times; L.t_end = g_pool.times + batch;
+    L.starts = starts_in; L.goals = goals_in; L.cons = cons_in; L.best = best_in;
+    L.w_sph = w_sph; L.w_cap = w_cap; L.w_box = w_box; L.w_hs = w_hs;
+    L.counts = counts_in;
+    L.batch = batch; L.dim = dim; L.num_goals = num_goals; L.max_nodes = max_nodes; L.wps_size = wps_size;
+    L.max_w[0] = mw0; L.max_w[1] = mw1; L.max_w[2] = mw2; L.max_w[3] = mw3;
+
+    prrax_init_batch_kernel<<<batch, 256, 0, stream>>>(L);
+    prrax_roots_batch_kernel<<<batch, 32, 0, stream>>>(L, min_in, max_in);
+    // A problem gets num_new_samples blocks while the batch is large; the grid never exceeds
+    // what is resident at once (a persistent kernel must not wait on unscheduled blocks).
+    const int grid = static_cast<int>(std::min<long long>((long long)batch * S.num_new_samples, g_pool.grid_cap));
+    prrax_plan_batch_kernel<<<grid, granularity * PRRAX_WP_LANES, 0, stream>>>(
+        L, min_in, max_in, collision_mode, collision_margin,
+        S.max_iterations, step_size, S.num_new_samples, S.balance_mode, S.tree_ratio, S.dynamic_domain,
+        S.dd_alpha, S.dd_radius, S.dd_min_radius, granularity);
+    prrax_path_batch_kernel<<<batch, 32, 0, stream>>>(L, B.path, B.path_len,
+                                                       B.ktime,
+                                                       (wps_size > 1) ? granularity - 1 : 0, max_path);
+    if (S.shortcut_rounds > 0) {
+        const int seg_max = 16 * granularity;   // up to 16 steps of granularity waypoints
+        // Blocks per problem: enough to fill the GPU (the shortcut graph has up to K^2/2 pairs).
+        const int nb = std::max(1, g_pool.grid_cap / batch);
+        const int grid = batch * nb;
+        e = g_pool.reserve_seg((size_t)grid * seg_max * dim + (size_t)batch * max_path * dim
+                               + (size_t)batch * PRRAX_SC_ANCHORS * PRRAX_SC_ANCHORS);
+        if (e != cudaSuccess) return e;
+        auto launch = [&](int phase, int g) {
+            prrax_shortcut_batch_kernel<<<g, granularity * PRRAX_WP_LANES, 0, stream>>>(
+                L, B.path, B.path_len, min_in, max_in, collision_mode,
+                collision_margin, step_size, phase, max_path, g_pool.seg, seg_max, grid);
+        };
+        // Shortcuts first (MR. POP smooths first): smoothing then only checks the few
+        // waypoints left, at the same final cost per round.
+        for (int r = 0; r < S.shortcut_rounds; ++r) {
+            launch(4, batch);
+            launch(2, grid);
+            launch(3, batch);
+            for (int step = 0; step < PRRAX_BSPLINE_STEPS; ++step) { launch(0, grid); launch(1, grid); }
+        }
+    }
+    return cudaGetLastError();
+}
+
 // XLA FFI handler: a batch of independent problems, each with its own world. Three launches on
 // XLA's stream (setup, persistent planning, path tracing); nothing blocks the host.
 static ffi::Error PrrtcPlannerImpl(
@@ -1779,73 +1887,19 @@ static ffi::Error PrrtcPlannerImpl(
     int shortcut_rounds,
     int batch, int dim, int num_goals, int mw0, int mw1, int mw2, int mw3
 ) {
-    const float* in = inputs.typed_data();
-    const float* starts_in = in;                 in += (size_t)batch * dim;
-    const float* goals_in = in;                  in += (size_t)batch * num_goals * dim;
-    const float* min_in = in;                    in += dim;
-    const float* max_in = in;                    in += dim;
-    const float* w_sph = in;                     in += (size_t)batch * mw0 * 4;
-    const float* w_cap = in;                     in += (size_t)batch * mw1 * 7;
-    const float* w_box = in;                     in += (size_t)batch * mw2 * 15;
-    const float* w_hs = in;                      in += (size_t)batch * mw3 * 6;
-    const float* counts_in = in;                 in += (size_t)batch * 4;
-    const float* cons_in = in;                   in += (size_t)batch * PRRAX_CONS_SIZE;
-    const float* best_in = in;                   // [batch] AO-x cost bound (FLT_MAX: any path, < 0: skip)
-    const size_t wps_size = static_cast<size_t>(edge_wps_a->dimensions()[1]);
-    const int max_path = static_cast<int>(path->dimensions()[1]);
-    cudaError_t e = g_pool.reserve(batch, (size_t)4 * batch * max_nodes, granularity * PRRAX_WP_LANES);
-    if (e != cudaSuccess) return ffi::Error(ffi::ErrorCode::kInternal, cudaGetErrorString(e));
-
-    BatchLayout L;
-    L.ta_cfg = tree_a_configs->typed_data(); L.tb_cfg = tree_b_configs->typed_data();
-    L.wps_a = edge_wps_a->typed_data(); L.wps_b = edge_wps_b->typed_data(); L.radii = g_pool.radii;
-    L.cost = g_pool.radii + (size_t)2 * batch * max_nodes;
-    L.ta_par = tree_a_parents->typed_data(); L.tb_par = tree_b_parents->typed_data();
-    L.sizes = tree_sizes->typed_data(); L.completed = completed->typed_data();
-    L.iters = iter_count->typed_data(); L.conn = connection_info->typed_data(); L.solved = solved_flag->typed_data();
-    L.work = g_pool.ints; L.active = g_pool.ints + batch;
-    L.t_start = g_pool.times; L.t_end = g_pool.times + batch;
-    L.starts = starts_in; L.goals = goals_in; L.cons = cons_in; L.best = best_in;
-    L.w_sph = w_sph; L.w_cap = w_cap; L.w_box = w_box; L.w_hs = w_hs;
-    L.counts = counts_in;
-    L.batch = batch; L.dim = dim; L.num_goals = num_goals; L.max_nodes = max_nodes; L.wps_size = wps_size;
-    L.max_w[0] = mw0; L.max_w[1] = mw1; L.max_w[2] = mw2; L.max_w[3] = mw3;
-
-    prrax_init_batch_kernel<<<batch, 256, 0, stream>>>(L);
-    prrax_roots_batch_kernel<<<batch, 32, 0, stream>>>(L, min_in, max_in);
-    // A problem gets num_new_samples blocks while the batch is large; the grid never exceeds
-    // what is resident at once (a persistent kernel must not wait on unscheduled blocks).
-    const int grid = static_cast<int>(std::min<long long>((long long)batch * num_new_samples, g_pool.grid_cap));
-    prrax_plan_batch_kernel<<<grid, granularity * PRRAX_WP_LANES, 0, stream>>>(
-        L, min_in, max_in, collision_mode, collision_margin,
-        max_iterations, step_size, num_new_samples, balance_mode, tree_ratio, dynamic_domain,
-        dd_alpha, dd_radius, dd_min_radius, granularity);
-    prrax_path_batch_kernel<<<batch, 32, 0, stream>>>(L, path->typed_data(), path_len->typed_data(),
-                                                       kernel_time_ms->typed_data(),
-                                                       (wps_size > 1) ? granularity - 1 : 0, max_path);
-    if (shortcut_rounds > 0) {
-        const int seg_max = 16 * granularity;   // up to 16 steps of granularity waypoints
-        // Blocks per problem: enough to fill the GPU (the shortcut graph has up to K^2/2 pairs).
-        const int nb = std::max(1, g_pool.grid_cap / batch);
-        const int grid = batch * nb;
-        e = g_pool.reserve_seg((size_t)grid * seg_max * dim + (size_t)batch * max_path * dim
-                               + (size_t)batch * PRRAX_SC_ANCHORS * PRRAX_SC_ANCHORS);
-        if (e != cudaSuccess) return ffi::Error(ffi::ErrorCode::kInternal, cudaGetErrorString(e));
-        auto launch = [&](int phase, int g) {
-            prrax_shortcut_batch_kernel<<<g, granularity * PRRAX_WP_LANES, 0, stream>>>(
-                L, path->typed_data(), path_len->typed_data(), min_in, max_in, collision_mode,
-                collision_margin, step_size, phase, max_path, g_pool.seg, seg_max, grid);
-        };
-        // Shortcuts first (MR. POP smooths first): smoothing then only checks the few
-        // waypoints left, at the same final cost per round.
-        for (int r = 0; r < shortcut_rounds; ++r) {
-            launch(4, batch);
-            launch(2, grid);
-            launch(3, batch);
-            for (int step = 0; step < PRRAX_BSPLINE_STEPS; ++step) { launch(0, grid); launch(1, grid); }
-        }
-    }
-    e = cudaGetLastError();
+    PrraxPlanBuffers B{tree_a_configs->typed_data(), tree_b_configs->typed_data(),
+                       tree_a_parents->typed_data(), tree_b_parents->typed_data(),
+                       tree_sizes->typed_data(), completed->typed_data(), iter_count->typed_data(),
+                       connection_info->typed_data(), solved_flag->typed_data(),
+                       kernel_time_ms->typed_data(), edge_wps_a->typed_data(), edge_wps_b->typed_data(),
+                       path->typed_data(), path_len->typed_data(),
+                       static_cast<size_t>(edge_wps_a->dimensions()[1]),
+                       static_cast<int>(path->dimensions()[1])};
+    PrraxPlanSettings S{max_iterations, step_size, num_new_samples, balance_mode, tree_ratio,
+                        dynamic_domain, dd_alpha, dd_radius, dd_min_radius, max_nodes, granularity,
+                        collision_mode, collision_margin, shortcut_rounds, batch, dim, num_goals,
+                        {mw0, mw1, mw2, mw3}};
+    const cudaError_t e = prrax_plan_raw(stream, inputs.typed_data(), B, S);
     if (e != cudaSuccess) return ffi::Error(ffi::ErrorCode::kInternal, cudaGetErrorString(e));
     return ffi::Error::Success();
 }
@@ -2018,50 +2072,41 @@ __global__ void prrax_fill_int_kernel(int* x, int n, int v) {
     if (i < n) x[i] = v;
 }
 
-static ffi::Error PrraxSimplifyImpl(
-    cudaStream_t stream,
-    // packed inputs: min_vals [dim], max_vals [dim], world spheres [batch, mw0, 4], capsules
-    // [batch, mw1, 7], boxes [batch, mw2, 15], halfspaces [batch, mw3, 6], counts [batch, 4],
-    // constraints [batch, PRRAX_CONS_SIZE]
-    ffi::Buffer<ffi::DataType::F32> inputs,
-    ffi::Buffer<ffi::DataType::F32> path_in,      // [batch, max_path, dim]
-    ffi::Buffer<ffi::DataType::S32> len_in,       // [batch]
-    ffi::Result<ffi::Buffer<ffi::DataType::F32>> path,
-    ffi::Result<ffi::Buffer<ffi::DataType::S32>> path_len,
-    int rounds, float step_size, int granularity, int collision_mode, float collision_margin,
-    int batch, int dim, int mw0, int mw1, int mw2, int mw3)
-{
-    const float* in = inputs.typed_data();
+// In place on device: `path` [batch, max_path, dim] / `path_len` [batch]. `inputs` packs
+// min_vals [dim], max_vals [dim], world spheres [batch, mw0, 4], capsules [batch, mw1, 7], boxes
+// [batch, mw2, 15], halfspaces [batch, mw3, 6], counts [batch, 4], constraints
+// [batch, PRRAX_CONS_SIZE].
+static cudaError_t prrax_simplify_raw(cudaStream_t stream, const float* inputs, float* path, int* path_len,
+                                      int max_path, int rounds, float step_size, int granularity,
+                                      int collision_mode, float collision_margin, int batch, int dim,
+                                      const int mw[4]) {
+    const float* in = inputs;
     const float* min_in = in;            in += dim;
     const float* max_in = in;            in += dim;
-    const float* w_sph = in;             in += (size_t)batch * mw0 * 4;
-    const float* w_cap = in;             in += (size_t)batch * mw1 * 7;
-    const float* w_box = in;             in += (size_t)batch * mw2 * 15;
-    const float* w_hs = in;              in += (size_t)batch * mw3 * 6;
+    const float* w_sph = in;             in += (size_t)batch * mw[0] * 4;
+    const float* w_cap = in;             in += (size_t)batch * mw[1] * 7;
+    const float* w_box = in;             in += (size_t)batch * mw[2] * 15;
+    const float* w_hs = in;              in += (size_t)batch * mw[3] * 6;
     const float* counts_in = in;         in += (size_t)batch * 4;
     const float* cons_in = in;
-    const int max_path = static_cast<int>(path->dimensions()[1]);
-    cudaMemcpyAsync(path->typed_data(), path_in.typed_data(), sizeof(float) * (size_t)batch * max_path * dim,
-                    cudaMemcpyDeviceToDevice, stream);
-    cudaMemcpyAsync(path_len->typed_data(), len_in.typed_data(), sizeof(int) * batch, cudaMemcpyDeviceToDevice, stream);
     cudaError_t e = g_pool.reserve(batch, 1, granularity * PRRAX_WP_LANES);
-    if (e != cudaSuccess) return ffi::Error(ffi::ErrorCode::kInternal, cudaGetErrorString(e));
+    if (e != cudaSuccess) return e;
     BatchLayout L{};
     L.solved = g_pool.ints;                              // every problem "solved"
     prrax_fill_int_kernel<<<(batch + 255) / 256, 256, 0, stream>>>(L.solved, batch, 1);
     L.cons = cons_in; L.w_sph = w_sph; L.w_cap = w_cap; L.w_box = w_box; L.w_hs = w_hs; L.counts = counts_in;
     L.batch = batch; L.dim = dim;
-    L.max_w[0] = mw0; L.max_w[1] = mw1; L.max_w[2] = mw2; L.max_w[3] = mw3;
+    for (int k = 0; k < 4; ++k) L.max_w[k] = mw[k];
     const int seg_max = 16 * granularity;
     const int nb = std::max(1, g_pool.grid_cap / batch);
     const int grid = batch * nb;
     e = g_pool.reserve_seg((size_t)grid * seg_max * dim + (size_t)batch * max_path * dim
                            + (size_t)batch * PRRAX_SC_ANCHORS * PRRAX_SC_ANCHORS);
-    if (e != cudaSuccess) return ffi::Error(ffi::ErrorCode::kInternal, cudaGetErrorString(e));
+    if (e != cudaSuccess) return e;
     auto launch = [&](int phase, int g) {
         prrax_shortcut_batch_kernel<<<g, granularity * PRRAX_WP_LANES, 0, stream>>>(
-            L, path->typed_data(), path_len->typed_data(), min_in, max_in, collision_mode,
-            collision_margin, step_size, phase, max_path, g_pool.seg, seg_max, grid);
+            L, path, path_len, min_in, max_in, collision_mode, collision_margin, step_size, phase,
+            max_path, g_pool.seg, seg_max, grid);
     };
     for (int r = 0; r < rounds; ++r) {
         launch(4, batch);
@@ -2069,7 +2114,27 @@ static ffi::Error PrraxSimplifyImpl(
         launch(3, batch);
         for (int step = 0; step < PRRAX_BSPLINE_STEPS; ++step) { launch(0, grid); launch(1, grid); }
     }
-    e = cudaGetLastError();
+    return cudaGetLastError();
+}
+
+static ffi::Error PrraxSimplifyImpl(
+    cudaStream_t stream,
+    ffi::Buffer<ffi::DataType::F32> inputs,       // see prrax_simplify_raw
+    ffi::Buffer<ffi::DataType::F32> path_in,      // [batch, max_path, dim]
+    ffi::Buffer<ffi::DataType::S32> len_in,       // [batch]
+    ffi::Result<ffi::Buffer<ffi::DataType::F32>> path,
+    ffi::Result<ffi::Buffer<ffi::DataType::S32>> path_len,
+    int rounds, float step_size, int granularity, int collision_mode, float collision_margin,
+    int batch, int dim, int mw0, int mw1, int mw2, int mw3)
+{
+    const int max_path = static_cast<int>(path->dimensions()[1]);
+    cudaMemcpyAsync(path->typed_data(), path_in.typed_data(), sizeof(float) * (size_t)batch * max_path * dim,
+                    cudaMemcpyDeviceToDevice, stream);
+    cudaMemcpyAsync(path_len->typed_data(), len_in.typed_data(), sizeof(int) * batch, cudaMemcpyDeviceToDevice, stream);
+    const int mw[4] = {mw0, mw1, mw2, mw3};
+    const cudaError_t e = prrax_simplify_raw(stream, inputs.typed_data(), path->typed_data(), path_len->typed_data(),
+                                             max_path, rounds, step_size, granularity, collision_mode,
+                                             collision_margin, batch, dim, mw);
     return e == cudaSuccess ? ffi::Error::Success() : ffi::Error(ffi::ErrorCode::kInternal, cudaGetErrorString(e));
 }
 
