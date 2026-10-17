@@ -6,3 +6,7 @@ __pycache__/
 cuda-rrtc.*.so
 cuda-rrtc/jax/__pycache__/*
 rtp_demo_example.py
+pyroffi
+*.pdf
+bench_results/*
+

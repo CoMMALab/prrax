@@ -45,27 +45,19 @@ try:
     config_collision_report = utils_mod.config_collision_report
 except Exception as e:
     print(f"cuda-rrtc import error: {e}")
-    print("Make sure the library is compiled: cd cuda-rrtc && bash build.sh")
+    print("The planner is built per robot on first use (needs nvcc, pyroffi-grim with GRiM and cricket2).")
     sys.exit(1)
 
 
-RESOURCE_ROOT = Path("/home/scoumar/Work/rrax/pyroffi/resources")
+RESOURCE_ROOT = Path(__file__).resolve().parent / "pyroffi" / "resources"
 PANDA_URDF = RESOURCE_ROOT / "panda" / "panda_spherized.urdf"
 
 
-def _slice_collision_context(base_ctx: dict, *, world_spheres_keep: int, self_pairs_keep: int) -> dict:
-    """Clone collision context while trimming selected world/self geometry arrays."""
+def _slice_collision_context(base_ctx: dict, *, world_spheres_keep: int) -> dict:
+    """Clone collision context while trimming its world spheres (the robot model is baked)."""
     out = dict(base_ctx)
-
     ws = np.asarray(base_ctx.get("world_spheres", np.zeros((0, 4), dtype=np.float32)), dtype=np.float32)
-    sp = np.asarray(base_ctx.get("self_pairs", np.zeros((0, 2), dtype=np.int32)), dtype=np.int32)
-
-    keep_ws = max(0, min(int(world_spheres_keep), int(ws.shape[0])))
-    keep_sp = max(0, min(int(self_pairs_keep), int(sp.shape[0])))
-
-    out["world_spheres"] = ws[:keep_ws]
-    out["self_pairs"] = sp[:keep_sp]
-
+    out["world_spheres"] = ws[:max(0, min(int(world_spheres_keep), int(ws.shape[0])))]
     return out
 
 
@@ -353,7 +345,7 @@ def main():
     single_result = None
     if roots_valid:
         try:
-            single_plan_kwargs = dict(
+            single_plan_kwargs = dict(return_trees=True,
                 start_config=start_config,
                 goal_configs=goal_config.reshape(1, -1),
                 max_iterations=5000,
@@ -429,19 +421,16 @@ def main():
                 retries += 1
 
         max_ws = int(collision_context.get("world_spheres", np.empty((0, 4), dtype=np.float32)).shape[0])
-        max_sp = int(collision_context.get("self_pairs", np.empty((0, 2), dtype=np.int32)).shape[0])
         per_problem_contexts = []
         for i in range(batch_size):
             if i % 2 == 0:
                 per_problem_contexts.append(collision_context)
             else:
                 ws_keep = max(0, max_ws - 1)
-                sp_keep = max(0, max_sp - 1)
                 per_problem_contexts.append(
                     _slice_collision_context(
                         collision_context,
                         world_spheres_keep=ws_keep,
-                        self_pairs_keep=sp_keep,
                     )
                 )
 

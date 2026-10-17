@@ -5,7 +5,7 @@ This package provides a JAX FFI wrapper for pRRTC CUDA kernels that integrate
 with PyRoFFI's existing CUDA backend for robotics kinematics and collision checking.
 
 Available modules:
-  - cuda: CUDA kernels for nearest neighbor, extension, and planning
+  - CUDA: the planner kernel and its manifold-constraint projection (built per robot through GRiM)
   - jax: JAX interface for easy integration with JAX computations
 
 Example usage:

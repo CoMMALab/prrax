@@ -116,17 +116,13 @@ def world_obstacles_to_exact(obstacles) -> dict[str, np.ndarray]:
     }
 
 
-def build_prrtc_collision_context(robot, robot_coll, world_obstacles):
-    """Build collision_context dict expected by cuda-rrtc/jax/prrtc.py."""
-    fk_twists = np.asarray(robot.joints.twists, dtype=np.float32)
-    fk_parent_tf = np.asarray(robot.joints.parent_transforms, dtype=np.float32)
-    fk_parent_idx = np.asarray(robot.joints.parent_indices, dtype=np.int32)
-    fk_act_idx = np.asarray(robot.joints.actuated_indices, dtype=np.int32)
-    fk_mimic_mul = np.asarray(robot.joints.mimic_multiplier, dtype=np.float32)
-    fk_mimic_off = np.asarray(robot.joints.mimic_offset, dtype=np.float32)
-    fk_mimic_act_idx = np.asarray(robot.joints.mimic_act_indices, dtype=np.int32)
-    fk_topo_inv = np.asarray(robot.joints._topo_sort_inv, dtype=np.int32)
+def build_prrtc_collision_context(robot, robot_coll, world_obstacles, attached_spheres=None):
+    """Build collision_context dict expected by cuda-rrtc/jax/prrtc.py.
 
+    The robot and its sphere model select the planner build (baked into it); the world
+    obstacles are per-call inputs. ``attached_spheres = (joint_frame, spheres [N, 4] xyz+r in
+    that frame)`` adds a held object's spheres, checked against the world (not self).
+    """
     sphere_local_full = np.asarray(robot_coll.coll.pose.translation(), dtype=np.float32)
     sphere_radius_full = np.asarray(robot_coll.coll.radius, dtype=np.float32)
     n_links, n_spheres_per_link = sphere_radius_full.shape
@@ -142,6 +138,11 @@ def build_prrtc_collision_context(robot, robot_coll, world_obstacles):
 
     parent_joint_indices = np.asarray(robot.links.parent_joint_indices, dtype=np.int32)
     joint_per_sphere = parent_joint_indices[raw_link_per_sphere]  # FK frame per fine sphere
+    if attached_spheres is not None:
+        frame, att = attached_spheres[0], np.asarray(attached_spheres[1], dtype=np.float32)
+        joint_per_sphere = np.concatenate((joint_per_sphere, np.full(len(att), frame, np.int32)))
+        local_per_sphere = np.concatenate((local_per_sphere, att[:, :3]))
+        radius_per_sphere = np.concatenate((radius_per_sphere, att[:, 3]))
 
     # --- Group fine spheres by FK frame and sort so each group is contiguous. ---
     # The CUDA planner can then gate the fine check on a per-group "dirty" flag set by a
@@ -185,7 +186,7 @@ def build_prrtc_collision_context(robot, robot_coll, world_obstacles):
 
     # --- Self-collision pairs (fine), grouped by coarse link-pair with [start,end) ranges. ---
     flat_index = np.full((n_links, n_spheres_per_link), -1, dtype=np.int32)
-    flat_index[valid] = new_index_of_old  # raw (link, slot) -> NEW sorted fine index
+    flat_index[valid] = new_index_of_old[: int(valid.sum())]  # raw (link, slot) -> NEW sorted fine index (attached spheres come last)
 
     active_i = np.asarray(robot_coll.active_idx_i, dtype=np.int32)
     active_j = np.asarray(robot_coll.active_idx_j, dtype=np.int32)
@@ -229,14 +230,7 @@ def build_prrtc_collision_context(robot, robot_coll, world_obstacles):
     world_geom = world_obstacles_to_exact(world_obstacles)
 
     return {
-        "fk_twists": fk_twists,
-        "fk_parent_tf": fk_parent_tf,
-        "fk_parent_idx": fk_parent_idx,
-        "fk_act_idx": fk_act_idx,
-        "fk_mimic_mul": fk_mimic_mul,
-        "fk_mimic_off": fk_mimic_off,
-        "fk_mimic_act_idx": fk_mimic_act_idx,
-        "fk_topo_inv": fk_topo_inv,
+        "robot": robot,
         "sphere_link_idx": sphere_link_idx,
         "sphere_local": sphere_local,
         "sphere_radius": sphere_radius,
