@@ -503,9 +503,10 @@ __device__ __forceinline__ bool prrtc_config_in_collision_binary_coarse(
 __device__ __forceinline__ bool prrtc_config_in_collision(
     const float* cfg,
     const CollisionContext& ctx,
-    int part = -1
+    int part = -1,
+    int lanes = PRRAX_WP_LANES
 ) {
-    const int first = part < 0 ? 0 : part, stride = part < 0 ? 1 : PRRAX_WP_LANES;
+    const int first = part < 0 ? 0 : part, stride = part < 0 ? 1 : lanes;
     if (!ctx.enabled) return false;
     
     float T_world[grim::robot::n_frames * 7];
@@ -532,6 +533,10 @@ __device__ __forceinline__ bool prrtc_config_in_collision(
 #endif
 #ifndef PRRAX_GAP_MAX_SUB
 #define PRRAX_GAP_MAX_SUB 64
+#endif
+// Lanes per sweep substep in the block-parallel edge check (they split its collision pairs).
+#ifndef PRRAX_SWEEP_LANES
+#define PRRAX_SWEEP_LANES 2
 #endif
 __device__ __forceinline__ bool prrtc_gap_invalid(const float* prev, const float* wp, int dim,
                                                   const CollisionContext& ctx, int part,
@@ -874,6 +879,7 @@ __device__ void plan_problem(
 
     // Collision check of the edge's W waypoints: base + (w+1)/W * delta, or the projected
     // waypoints in wp_sh for a constrained edge. Collective; true if any waypoint collides.
+    __shared__ int sweep_n_sh[32], sweep_off_sh[33];
     auto edge_in_collision = [&](const float* base, const float* delta) -> bool {
         // A solved problem needs no more checks: report the edge as blocked, so the block
         // falls through to its next stop check.
@@ -885,19 +891,57 @@ __device__ void plan_problem(
                                       &any_collision_sh, constrained ? wp_sh : nullptr,
                                       constrained ? cons_sh : nullptr, min_vals, max_vals);
         } else {
-            // Waypoint tid % W; lane tid / W checks its share of the collision pairs.
+            // VAMP's order, block-parallel. Round 0: the W waypoints (waypoint tid % W, lane
+            // tid / W checks its share of the pairs); any hit rejects the edge. Then the gap
+            // sweep as a flat list of substeps over all gaps, PRRAX_SWEEP_LANES threads per
+            // substep, one substep per thread group per round, stopping at the first failure.
+            auto point = [&](int w, float* out) {   // waypoint w (-1: base)
+                if (w < 0) { for (int d = 0; d < dim; ++d) out[d] = base[d]; return; }
+                if (constrained) { for (int d = 0; d < dim; ++d) out[d] = wp_sh[w * CONFIG_DIM_MAX + d]; return; }
+                edge_point(base, delta, static_cast<float>(w + 1) / static_cast<float>(W), out);
+            };
             const int slot = tid % W;
-            float interp[CONFIG_DIM_MAX], prev[CONFIG_DIM_MAX];
-            const float t_frac = static_cast<float>(slot + 1) / static_cast<float>(W);
-            if (constrained) {
-                for (int d = 0; d < dim; ++d) interp[d] = wp_sh[slot * CONFIG_DIM_MAX + d];
-                for (int d = 0; d < dim; ++d) prev[d] = slot == 0 ? base[d] : wp_sh[(slot - 1) * CONFIG_DIM_MAX + d];
-            } else {
-                edge_point(base, delta, t_frac, interp);
-                edge_point(base, delta, static_cast<float>(slot) / static_cast<float>(W), prev);
+            float x[CONFIG_DIM_MAX], prev[CONFIG_DIM_MAX];
+            point(slot, x);
+            bool bad = prrtc_config_in_collision(x, collision_ctx, tid / W);
+            if (tid < W) {
+                point(tid - 1, prev);
+                const float gap = sqrtf(prrax_cons::sq_dist(prev, x));
+                sweep_n_sh[tid] = min(PRRAX_GAP_MAX_SUB, max(1, static_cast<int>(ceilf(gap * PRRAX_RESOLUTION))));
             }
-            if (prrtc_gap_invalid(prev, interp, dim, collision_ctx, tid / W, constrained ? cons_sh : nullptr,
-                                  min_vals, max_vals)) atomicOr(&any_collision_sh, 1);
+            if (__syncthreads_or(bad)) {
+                if (tid == 0) any_collision_sh = 1;
+            } else {
+                if (tid == 0) {   // substeps s = 1..n-1 of gap w are items off[w] .. off[w+1]-1
+                    int acc = 0;
+                    for (int w = 0; w < W; ++w) { sweep_off_sh[w] = acc; acc += sweep_n_sh[w] - 1; }
+                    sweep_off_sh[W] = acc;
+                }
+                __syncthreads();
+                const int total = sweep_off_sh[W];
+                const int L = PRRAX_SWEEP_LANES, units = blockDim.x / L, unit = tid / L, part = tid % L;
+                for (int k0 = 0; k0 < total; k0 += units) {
+                    const int k = k0 + unit;
+                    bad = false;
+                    if (k < total) {
+                        int w = 0;
+                        while (sweep_off_sh[w + 1] <= k) ++w;
+                        const int n = sweep_n_sh[w], s = k - sweep_off_sh[w] + 1;
+                        float lin[CONFIG_DIM_MAX];
+                        point(w - 1, prev);
+                        point(w, x);
+                        const float t = static_cast<float>(s) / n;
+                        for (int d = 0; d < dim; ++d) x[d] = lin[d] = prev[d] + t * (x[d] - prev[d]);
+                        if (constrained) {
+                            const float sub = sqrtf(prrax_cons::sq_dist(prev, x)) / s;   // |gap| / n
+                            bad = !prrax_cons::tsr_project(cons_sh, x, min_vals, max_vals)
+                                  || prrax_cons::sq_dist(x, lin) >= 4.f * sub * sub;
+                        }
+                        if (!bad) bad = prrtc_config_in_collision(x, collision_ctx, L > 1 ? part : -1, L);
+                    }
+                    if (__syncthreads_or(bad)) { if (tid == 0) any_collision_sh = 1; break; }
+                }
+            }
         }
         __syncthreads();
         return any_collision_sh != 0;

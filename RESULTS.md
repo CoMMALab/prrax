@@ -1,6 +1,40 @@
 # prrax constrained planning: results and findings
 
-State as of commit `9ae098f` (branch `rtp_demo`). Raw benchmark records were kept locally (`bench_results/`, not committed).
+State as of commit `9ae098f` (branch `rtp_demo`), with a 2026-10-17 update below for the gap
+sweep and the edge-check reordering. Raw benchmark records were kept locally (`bench_results/`,
+not committed).
+
+## Update 2026-10-17: gap sweep cost and block-parallel edge check
+
+McVAMP = 1 core of a Threadripper PRO 5955WX, prrax = 1 RTX A5000; cpRRTC mode, single solves,
+median wall ms (kernel ms), every path checked with `--validate` (0 invalid).
+
+| set (problems) | McVAMP solved / median | prrax at `839746c` | prrax with this change |
+|---|---|---|---|
+| plane (1000) | 1000 / 0.50 | 1000 / 19.25 (12.98) | 1000 / 12.60 (8.82) |
+| plane + orientation (1000) | 1000 / 0.58 | 1000 / 20.41 (14.13) | not rerun |
+| line (766) | 758 / 0.15 | 766 / 11.76 (7.01) | not rerun |
+| line + orientation (766) | 751 / 0.22 | 766 / 12.99 (8.21) | not rerun |
+| maze, pen attached (100) | 79 / 6.03 | 79 / 15.05 (11.81) | 79 / 12.65 (9.79) |
+
+- The slowdown against the table below came in with `3fe011c`: the VAMP gap sweep
+  (`prrtc_gap_invalid`, projected substeps at 32 per rad) made each iteration ~2.9x more
+  expensive at equal iteration counts. It is the cost of checking edges as VAMP does; kept.
+- In the sweep, collision checks are ~82% and projection ~18% (substeps start on the manifold:
+  one LM iteration).
+- Edge check reordered to VAMP's order on the block: one round checks all W waypoints (any hit
+  rejects the edge), then the substeps of all gaps form one list, `PRRAX_SWEEP_LANES` (2)
+  threads per substep, one substep per group per round, block exit on the first failure
+  (`__syncthreads_or`). Verdicts unchanged; plane kernel -32%, maze -17%, plane p95 109 -> 53 ms.
+  Unlike the rejected endpoint-first check below, no thread does serial work alone.
+- Why the gap stays large: one collision check is ~64k cycles (~38 µs at 1.68 GHz) on one GPU
+  thread against 0.65 µs for McVAMP. One dependent instruction stream issues at ~5.4 cycles per
+  instruction, ~40x slower than a CPU core, not ~5x.
+- Benchmark host time includes jit recompiles for shapes that vary per problem (obstacle count,
+  path length): ~6 ms per problem over the plane set against ~1.6 ms steady state.
+- Tried and rejected: caching fine-sphere world positions in the self-collision loop (1.46x on
+  random configs in isolation, no planner gain); `binary_coarse_coop` (2x slower, lane-0
+  projection).
 
 ## What prrax is now
 - pRRTC (GPU RRT-Connect) built per robot through GRiM (`pyroffi-grim`): cricket2-traced FK, the
