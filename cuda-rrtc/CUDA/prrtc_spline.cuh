@@ -7,20 +7,38 @@
 // polyline), in chord-length parameter s (|dq/ds| ~ 1). The curve is C1 (a continuous tangent
 // space), vertices and endpoints exact, its end tangents its own (Akima's end conditions).
 //
-// Validation: each Hermite piece gets ceil(|control polygon| * PRRAX_RESOLUTION) samples (the
-// control polygon bounds the piece's length, so VAMP's resolution holds), and every sample passes
-// the planner's own binary collision check (lanes splitting the pairs) and, when the edge is
-// constrained, its TSRs (hinged error within CONS_TOL).
+// Validation (VAMP's order): each Hermite piece gets ceil(|control polygon| * PRRAX_RESOLUTION)
+// samples (the control polygon bounds the piece's length, so VAMP's resolution holds). Collision
+// (the planner's own binary check, lanes splitting the pairs): first a coarse pass, every
+// ceil(N / 16)-th sample along the whole curve -- most failures exit there -- then the rest. Only a
+// collision-free curve gets the TSR pass: PRRAX_SPLINE_OVERSAMPLE x denser, FK only, hinged error
+// within CONS_TOL.
+//
+// Optional: end slopes clamped (slope_a / slope_b [n, dim], NaN first entry = Akima's own), so a
+// curve joins a neighbour C1 in the neighbour's parameter; the knots, slopes and chord parameter
+// of every valid curve written out (knots [n, PRRAX_SPLINE_MAX_KNOTS, 2 dim + 1]: q | dq/ds | s).
 //
 // Refinement: a curve that bulges out of the TSR between knots (a polyline's projected waypoints
 // sit on the band's boundary) gets, for every piece that left it, the piece's midpoint projected
 // onto the TSR (prrax's own projection) as a new knot, and is refitted and revalidated -- up to
 // PRRAX_SPLINE_ROUNDS times. A collision, or a curve still outside the TSR after the last round,
 // fails the edge (status < 0): with smoothing on, the caller rejects it.
+//
+// Two-sided jobs (split != nullptr, split[p] >= 0): a curve through a pinned waypoint (vertex
+// split[p] of the polyline) between two regions -- e.g. a stroke and a transit. The waypoint stays a
+// knot (refinement only inserts midpoints) and the curve is C1 through it; every sample, and every
+// refinement projection, uses the constraints and world counts of its own side: pieces before the
+// waypoint knot (cons, counts), after it (cons_b, counts_b).
 // Requires prrtc_planner.cu (CollisionContext, prrtc_config_in_collision) and the constraints.
 #pragma once
 
 #define PRRAX_SPLINE_MAX_KNOTS 512
+// TSR samples per collision sample. Collision is checked at PRRAX_RESOLUTION (its margin covers the
+// gaps); the TSR has no margin and the curve bows past it between samples (a stroke <-> transit
+// junction dipped 0.009 mm past the tip floor at 1x), so it is checked this much denser (FK only).
+#ifndef PRRAX_SPLINE_OVERSAMPLE
+#define PRRAX_SPLINE_OVERSAMPLE 4
+#endif
 #define PRRAX_SPLINE_ROUNDS 6
 
 struct SplineJob {
@@ -36,6 +54,13 @@ struct SplineJob {
     int* status;               // [n] 1 valid curve; 0 no path; -1 over the knot / sample caps; -2 leaves
                                // the TSR (after refinement); -3 collides
     int max_dense;
+    const float* counts_b = nullptr;   // [n, 4] two-sided jobs: the second side's world counts
+    const float* cons_b = nullptr;     // [n, PRRAX_CONS_SIZE] ... and constraints
+    const int* split = nullptr;        // [n] the waypoint's vertex index (< 0: one-sided)
+    const float* slope_a = nullptr;    // [n, dim] clamped start slope dq/ds (NaN first entry: free)
+    const float* slope_b = nullptr;    // [n, dim] clamped end slope
+    float* knots = nullptr;            // [n, PRRAX_SPLINE_MAX_KNOTS, 2 dim + 1] out: q | dq/ds | s per knot
+    int* n_knots = nullptr;            // [n]
 };
 
 __device__ __forceinline__ void hermite(const float* p0, const float* m0, const float* p1, const float* m1, float h,
@@ -53,11 +78,11 @@ __global__ void prrax_spline_kernel(SplineJob J) {
     __shared__ float S[PRRAX_SPLINE_MAX_KNOTS];                    // chord-length parameter
     __shared__ int off[PRRAX_SPLINE_MAX_KNOTS];                    // first sample of each piece
     __shared__ int out_piece[PRRAX_SPLINE_MAX_KNOTS];              // the piece left the TSR this round
-    __shared__ int mk_sh, total_sh, coll_sh, tsr_sh, status_sh;
-    __shared__ CollisionContext ctx;
-    const float* cons = J.cons + (size_t)p * PRRAX_CONS_SIZE;
-    const bool tsr = cons[CONS_N] > 0.f;
-    const float tol2 = cons[CONS_TOL] * cons[CONS_TOL];
+    __shared__ int mk_sh, total_sh, coll_sh, tsr_sh, status_sh, sk_sh;
+    __shared__ CollisionContext ctx, ctx_b;
+    const int split_v = J.split ? J.split[p] : -1;
+    const float* cons_a = J.cons + (size_t)p * PRRAX_CONS_SIZE;
+    const float* cons_b = split_v >= 0 ? J.cons_b + (size_t)p * PRRAX_CONS_SIZE : cons_a;
     if (tid == 0) {
         J.dense_len[p] = 0;
         status_sh = J.solved[p] == 1 && J.lens[p] >= 2 ? 1 : 0;
@@ -71,6 +96,15 @@ __global__ void prrax_spline_kernel(SplineJob J) {
         ctx.enabled = (prrax::n_spheres > 0 && (k[0] > 0.f || k[1] > 0.f || k[2] > 0.f || k[3] > 0.f ||
                                                 prrax::n_self_pairs > 0)) ? 1 : 0;
         ctx.collision_mode = J.collision_mode; ctx.collision_margin = J.collision_margin; ctx.solved = nullptr;
+        ctx_b = ctx;
+        if (split_v >= 0) {
+            const float* kb = J.counts_b + p * 4;
+            ctx_b.n_world_spheres = (int)kb[0]; ctx_b.n_world_capsules = (int)kb[1];
+            ctx_b.n_world_boxes = (int)kb[2]; ctx_b.n_world_halfspaces = (int)kb[3];
+            ctx_b.enabled = (prrax::n_spheres > 0 && (kb[0] > 0.f || kb[1] > 0.f || kb[2] > 0.f || kb[3] > 0.f ||
+                                                      prrax::n_self_pairs > 0)) ? 1 : 0;
+        }
+        sk_sh = 1 << 30;   // the waypoint knot (one-sided: none, every piece on side a)
 
         // knots: the vertices with duplicates merged (a zero-length piece breaks the slopes), the
         // end vertex kept exactly
@@ -85,9 +119,11 @@ __global__ void prrax_spline_kernel(SplineJob J) {
         for (int k = 0; status_sh == 1 && k < m; ++k) {
             const float* v = path + (size_t)k * dim;
             if (c > 0 && dist(v, X + (c - 1) * Q) < 1e-6f) {
-                if (k == m - 1 && c > 1) for (int d = 0; d < dim; ++d) X[(c - 1) * Q + d] = v[d];   // keep the end exact
+                if ((k == m - 1 || k == split_v) && c > 1) for (int d = 0; d < dim; ++d) X[(c - 1) * Q + d] = v[d];   // keep the end / waypoint exact
+                if (k == split_v) sk_sh = c - 1;
                 continue;
             }
+            if (k == split_v) sk_sh = c;
             if (c == PRRAX_SPLINE_MAX_KNOTS) { status_sh = -1; break; }
             for (int d = 0; d < dim; ++d) X[c * Q + d] = v[d];
             ++c;
@@ -128,6 +164,8 @@ __global__ void prrax_spline_kernel(SplineJob J) {
                 const float w1 = fabsf(sec(k + 1) - sec(k)), w2 = fabsf(sec(k - 1) - sec(k - 2));
                 M[k * Q + d] = (w1 + w2 > 1e-9f) ? (w1 * sec(k - 1) + w2 * sec(k)) / (w1 + w2) : 0.5f * (sec(k - 1) + sec(k));
             }
+            if (J.slope_a && !isnan(J.slope_a[(size_t)p * dim])) M[d] = J.slope_a[(size_t)p * dim + d];
+            if (J.slope_b && !isnan(J.slope_b[(size_t)p * dim])) M[(mk - 1) * Q + d] = J.slope_b[(size_t)p * dim + d];
         }
         __syncthreads();
         // samples per piece, from its Bezier control polygon (an upper bound on the piece's length)
@@ -152,35 +190,61 @@ __global__ void prrax_spline_kernel(SplineJob J) {
         }
         __syncthreads();
         if (status_sh != 1) break;
-        // every sample, PRRAX_WP_LANES lanes each (they split the collision pairs): a collision ends
-        // the edge; TSR violations mark their piece for refinement
         const int N = total_sh;
-        for (int i = tid / PRRAX_WP_LANES; i < N; i += groups) {
-            if (*(volatile int*)&coll_sh) break;
-            float q[CONFIG_DIM_MAX];
-            int k = 0;
-            if (i == 0) {
-                for (int d = 0; d < dim; ++d) q[d] = X[d];
-            } else {
-                int lo = 0, hi = mk - 2;                 // the last piece starting at or before i holds it
-                while (lo < hi) { const int md = (lo + hi + 1) / 2; if (off[md] <= i) lo = md; else hi = md - 1; }
-                k = lo;
-                hermite(X + k * Q, M + k * Q, X + (k + 1) * Q, M + (k + 1) * Q, S[k + 1] - S[k],
-                        static_cast<float>(i - off[k] + 1) / (off[k + 1] - off[k]), dim, q);
+        // sample i of the curve (i in [0, N), fractional: a TSR sub-sample) and its piece
+        auto at = [&](float i, float* q) -> int {
+            if (i <= 0.f) { for (int d = 0; d < dim; ++d) q[d] = X[d]; return 0; }
+            int lo = 0, hi = mk - 2;                     // the last piece whose samples start before i
+            while (lo < hi) { const int md = (lo + hi + 1) / 2; if (off[md] - 1 < i) lo = md; else hi = md - 1; }
+            hermite(X + lo * Q, M + lo * Q, X + (lo + 1) * Q, M + (lo + 1) * Q, S[lo + 1] - S[lo],
+                    (i - off[lo] + 1) / (off[lo + 1] - off[lo]), dim, q);
+            return lo;
+        };
+        // collision, coarse to fine: every stride-th sample, then the rest (early exit on a hit)
+        const int stride = max(1, (N + 15) / 16), n_coarse = (N + stride - 1) / stride;
+        for (int pass = 0; pass < 2; ++pass) {
+            const int n_pass = pass == 0 ? n_coarse : N - n_coarse;
+            for (int j = tid / PRRAX_WP_LANES; j < n_pass; j += groups) {
+                if (*(volatile int*)&coll_sh) break;
+                const int i = pass == 0 ? j * stride : j + j / (stride - 1) + 1;   // the j-th non-multiple
+                float q[CONFIG_DIM_MAX];
+                const int k = at(static_cast<float>(i), q);
+                if (lane == 0) for (int d = 0; d < dim; ++d) out[(size_t)i * dim + d] = q[d];
+                if (prrtc_config_in_collision(q, k >= sk_sh ? ctx_b : ctx, lane)) { atomicOr(&coll_sh, 1); break; }
             }
-            if (lane == 0) for (int d = 0; d < dim; ++d) out[(size_t)i * dim + d] = q[d];
-            if (lane == 0 && tsr && prrax_cons::tsr_error_all(cons, q) > tol2) { out_piece[k] = 1; tsr_sh = 1; }
-            if (prrtc_config_in_collision(q, ctx, lane)) { atomicOr(&coll_sh, 1); break; }
+            __syncthreads();
+            if (coll_sh) break;
         }
-        __syncthreads();
+        // TSR, PRRAX_SPLINE_OVERSAMPLE x denser (one thread per sub-sample, FK only)
+        if (!coll_sh && (cons_a[CONS_N] > 0.f || cons_b[CONS_N] > 0.f)) {
+            const int n_sub = (N - 1) * PRRAX_SPLINE_OVERSAMPLE + 1;
+            for (int t = tid; t < n_sub; t += blockDim.x) {
+                float q[CONFIG_DIM_MAX];
+                const int k = at(static_cast<float>(t) / PRRAX_SPLINE_OVERSAMPLE, q);
+                const float* cons = k >= sk_sh ? cons_b : cons_a;
+                const float tol = cons[CONS_TOL];
+                if (cons[CONS_N] > 0.f && prrax_cons::tsr_error_all(cons, q) > tol * tol) { out_piece[k] = 1; tsr_sh = 1; }
+            }
+            __syncthreads();
+        }
         if (tid == 0) {
             if (coll_sh) status_sh = -3;
-            else if (!tsr_sh) { status_sh = 2; J.dense_len[p] = N; }          // valid
+            else if (!tsr_sh) {                                                 // valid
+                status_sh = 2; J.dense_len[p] = N;
+                if (J.knots) {
+                    float* o = J.knots + (size_t)p * PRRAX_SPLINE_MAX_KNOTS * (2 * dim + 1);
+                    for (int k = 0; k < mk; ++k, o += 2 * dim + 1) {
+                        for (int d = 0; d < dim; ++d) { o[d] = X[k * Q + d]; o[dim + d] = M[k * Q + d]; }
+                        o[2 * dim] = S[k];
+                    }
+                    J.n_knots[p] = mk;
+                }
+            }
             else if (round + 1 >= PRRAX_SPLINE_ROUNDS) status_sh = -2;
             else {
                 // refine: the projected midpoint of every piece that left the TSR becomes a knot
-                int add = 0;
-                for (int k = 0; k + 1 < mk; ++k) add += out_piece[k];
+                int add = 0, add_before = 0;
+                for (int k = 0; k + 1 < mk; ++k) { add += out_piece[k]; if (k < sk_sh) add_before += out_piece[k]; }
                 if (mk + add > PRRAX_SPLINE_MAX_KNOTS) status_sh = -1;
                 for (int k = mk - 2, top = mk - 1 + add; status_sh == 1 && k >= 0; --k) {
                     for (int d = 0; d < dim; ++d) X[top * Q + d] = X[(k + 1) * Q + d];   // knot k+1 moves up
@@ -188,12 +252,13 @@ __global__ void prrax_spline_kernel(SplineJob J) {
                     if (out_piece[k]) {
                         float q[CONFIG_DIM_MAX];
                         hermite(X + k * Q, M + k * Q, X + (k + 1) * Q, M + (k + 1) * Q, S[k + 1] - S[k], 0.5f, dim, q);
-                        if (!prrax_cons::tsr_project(cons, q, J.lo, J.hi)) { status_sh = -2; break; }
+                        if (!prrax_cons::tsr_project(k >= sk_sh ? cons_b : cons_a, q, J.lo, J.hi)) { status_sh = -2; break; }
                         for (int d = 0; d < dim; ++d) X[top * Q + d] = q[d];
                         --top;
                     }
                 }
                 mk_sh = mk + add;
+                if (sk_sh < (1 << 30)) sk_sh += add_before;   // knots inserted before the waypoint shift it
             }
         }
         __syncthreads();
