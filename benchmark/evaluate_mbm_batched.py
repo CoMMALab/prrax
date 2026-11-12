@@ -63,7 +63,7 @@ from pyroffi.collision._obstacles import create_collision_environment
 from pyroffi.collision._robot_collision import RobotCollisionSpherized
 
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parents[1]
 RESOURCES = ROOT / "pyroffi" / "resources"
 SOLVE_BATCH_CHUNK_SIZE = 25
 STEP_SIZE_BY_ROBOT = {

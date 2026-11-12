@@ -188,7 +188,7 @@ def verify_robot_collision_context(
             )
 
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parents[1]
 RESOURCES = ROOT / "pyroffi" / "resources"
 TQDM_DISABLE = not sys.stdout.isatty()
 STEP_SIZE_BY_ROBOT = {

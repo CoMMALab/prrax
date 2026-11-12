@@ -13,7 +13,7 @@ McVAMP's --results files (success, solve_time_ns, iterations, num_cuboid_obstacl
 on_manifold), so compare_mcvamp.py can join them; solve_time_ns is host wall time of the
 solve (kernel time is recorded too). path_cost is unsimplified (McVAMP reports simplified).
 
-    python benchmark_constrained.py --problems plane [--keep-orientation] [--mode mcvamp|cprrtc]
+    python benchmark/benchmark_constrained.py --problems plane [--keep-orientation] [--mode mcvamp|cprrtc]
                                     [--batch] [--limit N] [--results FILE]
 """
 
@@ -29,7 +29,7 @@ import jax.numpy as jnp
 import jaxlie
 import numpy as np
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parents[1]
 ASSETS = ROOT / "mcvamp" / "experiments" / "assets"
 PANDA = ROOT / "pyroffi" / "resources" / "panda"
 EE_LINK = "panda_grasptarget"

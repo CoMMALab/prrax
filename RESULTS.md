@@ -44,7 +44,7 @@ median wall ms (kernel ms), every path checked with `--validate` (0 invalid).
   connect tolerance match McVAMP's (|d| < 1e-3); they were deliberately not loosened.
 - One persistent kernel per call for the whole batch; 4 threads per edge waypoint (as pRRTC).
 - Checks: `test_constrained.py` (TSR error vs JAX reference, projection, valid paths),
-  `test_prrtc.py`, `benchmark_constrained.py --validate` (every path independently checked on the
+  `test_prrtc.py`, `benchmark/benchmark_constrained.py --validate` (every path independently checked on the
   manifold and collision-free: no invalid path in any final run), `compare_mcvamp.py`.
 
 ## Benchmarks (McVAMP's Panda sets; McVAMP = 1 core i7-13700K, prrax = 1 RTX A5000)

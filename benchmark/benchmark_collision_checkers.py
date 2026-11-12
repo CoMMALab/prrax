@@ -19,8 +19,8 @@ then ``--trials`` timed solves on the *same* start/goal/problem, and report wall
 time (host dispatch + GPU sync) and the pure GPU planner-kernel time.
 
 Usage:
-    python benchmark_collision_checkers.py
-    python benchmark_collision_checkers.py --vamp-problem bookshelf_tall --vamp-index 1 \
+    python benchmark/benchmark_collision_checkers.py
+    python benchmark/benchmark_collision_checkers.py --vamp-problem bookshelf_tall --vamp-index 1 \
         --trials 30 --max-iterations 5000 --collision-margin 0.02
 """
 
@@ -42,7 +42,7 @@ from prrax.jax.utils import load_vamp_problem, build_prrtc_collision_context, co
 
 
 # Resources ship inside the checked-out pyroffi alongside this repo.
-RESOURCE_ROOT = Path(__file__).resolve().parent / "pyroffi" / "resources"
+RESOURCE_ROOT = Path(__file__).resolve().parents[1] / "pyroffi" / "resources"
 PANDA_URDF = RESOURCE_ROOT / "panda" / "panda_spherized.urdf"
 
 # binary            — flat single-tier early-exit sweep (baseline)
