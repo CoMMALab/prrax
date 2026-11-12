@@ -20,7 +20,7 @@ from prrax.jax import prrtc_plan, prrtc_plan_batch
 from prrax.jax.utils import load_vamp_problem, build_prrtc_collision_context, config_collision_report
 
 
-RESOURCE_ROOT = Path(__file__).resolve().parent / "pyroffi" / "resources"
+RESOURCE_ROOT = Path(__file__).resolve().parents[1] / "pyroffi" / "resources"
 PANDA_URDF = RESOURCE_ROOT / "panda" / "panda_spherized.urdf"
 
 
