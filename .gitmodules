@@ -1,0 +1,6 @@
+[submodule "mcvamp"]
+	path = mcvamp
+	url = https://github.com/commalab/mcvamp
+[submodule "pRRTC"]
+	path = pRRTC
+	url = https://github.com/commalab/pRRTC

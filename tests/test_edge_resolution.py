@@ -1,9 +1,8 @@
-#!/usr/bin/env python3
 """Edge validation at VAMP's resolution: paths from every collision checker, unconstrained and
 constrained, plain and simplified, are collision-free when re-checked at 1/64 rad (twice
 VAMP's 1/32 rad), so no checker validates an edge by its waypoints alone.
 
-    python test_edge_resolution.py
+    pytest tests/test_edge_resolution.py
 """
 
 from __future__ import annotations
@@ -17,7 +16,7 @@ import benchmark_constrained as B
 P = B.PRRTC
 
 
-def main() -> None:
+def test_edge_resolution() -> None:
     from pyroffi.collision._geometry import Box
 
     robot, coll = B.load_panda()
@@ -55,6 +54,3 @@ def main() -> None:
                 assert worst >= -1e-3, f"{label}: clips through by {-worst:.4f} m"
                 print(f"{label}: min clearance at 1/64 rad {worst:.4f} m")
 
-
-if __name__ == "__main__":
-    main()

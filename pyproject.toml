@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "prrax"
+version = "0.1.0"
+description = "GPU-parallel RRT-Connect (pRRTC) through the JAX FFI"
+requires-python = ">=3.11"
+# pyroffi (pyroffi-grim) is not on PyPI: pip install -e ../pyroffi-grim
+dependencies = ["jax", "numpy", "jaxtyping", "jaxlie", "yourdfpy"]
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[tool.setuptools]
+packages = ["prrax", "prrax.jax"]
+package-dir = { prrax = "cuda-rrtc", "prrax.jax" = "cuda-rrtc/jax" }
+
+[tool.setuptools.package-data]
+prrax = ["CUDA/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

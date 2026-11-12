@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Check of the AO-x passes (``ao_passes``, MR. POP / pAORRTC) on McVAMP's Panda problems.
 
 Unconstrained and constrained (cpRRTC projection), single and batched: the kept path stays
@@ -6,7 +5,7 @@ valid (collision-free along densified edges; on the manifold when constrained) a
 than a plain solve's on most problems (solves are not deterministic across blocks). The same
 for MR. POP's path simplification (``shortcut_rounds``), alone and between AO-x passes.
 
-    python test_ao.py
+    pytest tests/test_ao.py
 """
 
 from __future__ import annotations
@@ -20,7 +19,7 @@ import benchmark_constrained as B
 P = B.PRRTC
 
 
-def main() -> None:
+def test_ao() -> None:
     from pyroffi.collision._geometry import Box
 
     robot, coll = B.load_panda()
@@ -80,6 +79,3 @@ def main() -> None:
               f"{mean(ao_simp):.3f}; kernel ms {ms(base):.1f} / {ms(simp):.1f} / {ms(ao):.1f} / "
               f"{ms(ao_simp):.1f}; every path valid")
 
-
-if __name__ == "__main__":
-    main()

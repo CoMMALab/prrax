@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Checks of constrained pRRTC (CUDA/prrtc_constraint.cuh) against independent references.
 
 1. TSR error of the CUDA build vs a JAX reference (pyroffi FK + jaxlie) at random configs.
@@ -9,7 +8,7 @@
    orientation TSR on the same frame): every path waypoint is on the manifold (JAX) and
    collision-free (pyroffi).
 
-    python test_constrained.py
+    pytest tests/test_constrained.py
 """
 
 from __future__ import annotations
@@ -22,7 +21,7 @@ import benchmark_constrained as B
 P = B.PRRTC
 
 
-def main() -> None:
+def test_constrained() -> None:
     robot, coll = B.load_panda()
     ctx = B.make_context(robot, coll, maze=False)
     lo = jnp.asarray(robot.joints.lower_limits, jnp.float32)
@@ -104,6 +103,3 @@ def main() -> None:
     else:
         print(f"3. two constraints: skipped, problem 7's start/goal violate the orientation TSR ({err0})")
 
-
-if __name__ == "__main__":
-    main()

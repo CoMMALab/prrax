@@ -43,7 +43,7 @@ except ImportError as e:
     print("Please install pyroffi and yourdfpy")
     sys.exit(1)
 
-# --- Load the cuda-rrtc JAX wrappers directly from source (mirrors test_prrtc.py) ---
+# --- Load the cuda-rrtc JAX wrappers directly from source (mirrors demo_prrtc.py) ---
 try:
     _here = Path(__file__).resolve().parent
     prrtc_impl = _here / "cuda-rrtc" / "jax" / "prrtc.py"

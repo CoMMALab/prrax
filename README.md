@@ -11,14 +11,23 @@ prrax depends on [pyroffi v1.0](../pyroffi-grim). PyRoFFI vendors a CUDA backend
 conda activate prrax
 pip install -e ../pyroffi-grim
 bash ../pyroffi-grim/build_kernels/build_cricket.sh     # installs cricket2 (GRiM's trace compiler)
-ln -sfn ../pyroffi-grim pyroffi
+ln -sfn ../pyroffi-grim pyroffi                         # resources used by tests/benchmarks
+git submodule update --init                             # mcvamp (benchmark assets), pRRTC (reference)
+pip install -e ".[test]"                                # installs the `prrax` package (from cuda-rrtc/)
+```
+
+```python
+from prrax.jax import prrtc_plan, prrtc_plan_batch
+```
+
+## Tests
+
+```bash
+pytest   # needs a GPU; the planner is built per robot on first use
 ```
 
 
 Prerequisites: CUDA toolkit (`nvcc`), Python 3.11+, jax/jaxlib with CUDA.
-
-
-The following papers were used as reference material in the implementation of this repository:
 
 
 ## References

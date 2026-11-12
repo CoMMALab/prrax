@@ -10,3 +10,8 @@ pyroffi
 *.pdf
 bench_results/*
 
+bench_results/
+rtp_demo/
+compare_mcvamp.py
+*.egg-info/
+.pytest_cache/

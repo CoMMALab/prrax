@@ -20,7 +20,6 @@ solve (kernel time is recorded too). path_cost is unsimplified (McVAMP reports s
 from __future__ import annotations
 
 import argparse
-import importlib.util
 import json
 import time
 from pathlib import Path
@@ -36,15 +35,7 @@ PANDA = ROOT / "pyroffi" / "resources" / "panda"
 EE_LINK = "panda_grasptarget"
 
 
-def _load(name: str, path: Path):
-    spec = importlib.util.spec_from_file_location(name, path)
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
-
-
-PRRTC = _load("cuda_rrtc_prrtc", ROOT / "cuda-rrtc" / "jax" / "prrtc.py")
-UTILS = _load("cuda_rrtc_utils", ROOT / "cuda-rrtc" / "jax" / "utils.py")
+from prrax.jax import prrtc as PRRTC, utils as UTILS
 
 
 def load_panda():
