@@ -56,7 +56,7 @@ def validate_path_collision(robot, robot_coll, path, world_obstacles):
     }
 
 
-def visualize_tree_with_viser(robot, urdf, result, obstacles=None, hz: float = 10.0):
+def visualize_tree_with_viser(robot, urdf, result, obstacles=None, hz: float = 10.0, simplify=None):
     """Visualize RRT trees as pointcloud + edges in task space, with optional solved path."""
     try:
         import viser
@@ -118,25 +118,23 @@ def visualize_tree_with_viser(robot, urdf, result, obstacles=None, hz: float = 1
     if segs_b is not None:
         server.scene.add_line_segments("/tree_b/edges", points=segs_b, colors=(255, 140, 80), line_width=1.0)
 
-    # Solved path overlay
-    if result.solved and result.path is not None:
-        path_np = np.array(result.path, dtype=np.float32)
-        fk_path = np.array(robot.forward_kinematics(jnp.array(path_np)))
-        ee_path = fk_path[:, ee_idx, 4:7]
-        server.scene.add_spline_catmull_rom("/solution_path", positions=ee_path, color=(0, 220, 60), line_width=3.0)
-
-    # URDF slider over the solved path (trees are shown as point clouds); start tree if unsolved
+    # URDF slider over the solved path (trees are shown as point clouds); start tree if unsolved.
+    # The solved path is drawn raw, shortcut and/or B-spline smoothed per the GUI checkboxes.
     all_configs = np.array(result.path, dtype=np.float32) if (result.solved and result.path is not None) else configs_a
     urdf_vis = ViserUrdf(server, urdf, root_node_name="/robot")
     slider = server.gui.add_slider("Node", min=0, max=len(all_configs) - 1, step=1, initial_value=0)
+    shown = [all_configs]
+    if result.solved and result.path is not None and simplify is not None:
+        from path_toggles import add_simplify_toggles
+        shown = add_simplify_toggles(server, robot, ee_idx, all_configs, slider=slider, **simplify)
 
     status = "SOLVED" if result.solved else "FAILED"
     print(f"\nTree visualization [{status}] — tree_a={result.tree_a_size} nodes, tree_b={result.tree_b_size} nodes")
-    print("Viewer running at http://localhost:8080  |  Press Ctrl+C to exit.")
+    print(f"Viewer running at http://localhost:{server.get_port()}  |  Press Ctrl+C to exit.")
     urdf_vis.update_cfg(all_configs[0])
     try:
         while True:
-            urdf_vis.update_cfg(all_configs[slider.value])
+            urdf_vis.update_cfg(shown[0][slider.value])
             time.sleep(1.0 / hz)
     except KeyboardInterrupt:
         print("\nStopping visualization.")
@@ -190,7 +188,7 @@ def visualize_path_with_viser(robot, urdf, path, obstacles=None, hz: float = 10.
     )
     playing = server.gui.add_checkbox("Playing", initial_value=True)
 
-    print("\nViewer running at http://localhost:8080  |  Press Ctrl+C to exit.")
+    print(f"\nViewer running at http://localhost:{server.get_port()}  |  Press Ctrl+C to exit.")
     urdf_vis.update_cfg(traj[0])
     try:
         while True:
@@ -466,6 +464,7 @@ def main():
                 urdf=urdf,
                 result=single_result,
                 obstacles=obstacles,
+                simplify=dict(collision_context=collision_context, lo=lo, hi=hi, step_size=0.5),
             )
 
     print("\n" + "=" * 70)

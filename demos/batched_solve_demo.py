@@ -98,7 +98,7 @@ def _build_edge_segments(pts: np.ndarray, parents: np.ndarray):
     return np.stack([starts, ends], axis=1)
 
 
-def visualize_batched_trees(robot, urdf, results, obstacles=None, hz: float = 10.0):
+def visualize_batched_trees(robot, urdf, results, obstacles=None, hz: float = 10.0, simplify=None):
     """Render every batch element's bidirectional tree in task space with a unique color."""
     try:
         import viser
@@ -207,13 +207,6 @@ def visualize_batched_trees(robot, urdf, results, obstacles=None, hz: float = 10
         if first_solution_path is None and result.solved and result.path is not None:
             first_solution_path = np.array(result.path, dtype=np.float32)
 
-    if first_solution_path is not None:
-        fk_path = np.array(robot.forward_kinematics(jnp.array(first_solution_path)))
-        ee_path = fk_path[:, ee_idx, 4:7]
-        server.scene.add_spline_catmull_rom(
-            "/solution_path", positions=ee_path, color=(0, 220, 60), line_width=4.0
-        )
-
     # URDF slider — cycle through the first solved path (or a default config otherwise).
     urdf_vis = ViserUrdf(server, urdf, root_node_name="/robot")
     slider_configs = (
@@ -225,19 +218,25 @@ def visualize_batched_trees(robot, urdf, results, obstacles=None, hz: float = 10
         "Node", min=0, max=len(slider_configs) - 1, step=1, initial_value=0
     )
     playing = server.gui.add_checkbox("Playing", initial_value=True)
+    # The first solved path, drawn raw, shortcut and/or B-spline smoothed per the GUI checkboxes.
+    shown = [slider_configs]
+    if first_solution_path is not None and simplify is not None:
+        from path_toggles import add_simplify_toggles
+        shown = add_simplify_toggles(server, robot, ee_idx, first_solution_path, slider=slider,
+                                     line_width=4.0, **simplify)
 
     solved_count = sum(1 for r in results if r.solved)
     print(
         f"\nBatched tree visualization: {solved_count}/{len(results)} solved "
         f"(colored per batch)."
     )
-    print("Viewer running at http://localhost:8080  |  Press Ctrl+C to exit.")
+    print(f"Viewer running at http://localhost:{server.get_port()}  |  Press Ctrl+C to exit.")
     urdf_vis.update_cfg(slider_configs[0])
     try:
         while True:
             if playing.value:
-                slider.value = (slider.value + 1) % len(slider_configs)
-            urdf_vis.update_cfg(slider_configs[slider.value])
+                slider.value = (slider.value + 1) % len(shown[0])
+            urdf_vis.update_cfg(shown[0][slider.value])
             time.sleep(1.0 / hz)
     except KeyboardInterrupt:
         print("\nStopping visualization.")
@@ -356,7 +355,8 @@ def main():
         diverse_results = select_diverse_trees(results, k=20)
         print(f"  Visualizing {len(diverse_results)} most diverse trees (of {len(results)}).")
         visualize_batched_trees(
-            robot=robot, urdf=urdf, results=diverse_results, obstacles=obstacles
+            robot=robot, urdf=urdf, results=diverse_results, obstacles=obstacles,
+            simplify=dict(collision_context=collision_context, lo=lo, hi=hi, step_size=args.step_size),
         )
 
     print("\nDone.")
