@@ -23,11 +23,6 @@ except ImportError as e:
     print("Please install pyroffi and yourdfpy")
     sys.exit(1)
 
-import pyroffi as pk
-import yourdfpy
-from pyroffi.collision._obstacles import create_collision_environment
-from pyroffi.collision._robot_collision import RobotCollisionSpherized
-
 from prrax.jax import prrtc_plan_batch
 from prrax.jax.utils import load_vamp_problem, build_prrtc_collision_context, config_collision_report
 
