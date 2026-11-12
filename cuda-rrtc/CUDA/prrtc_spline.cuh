@@ -85,6 +85,7 @@ __global__ void prrax_spline_kernel(SplineJob J) {
     const float* cons_b = split_v >= 0 ? J.cons_b + (size_t)p * PRRAX_CONS_SIZE : cons_a;
     if (tid == 0) {
         J.dense_len[p] = 0;
+        if (J.n_knots) J.n_knots[p] = 0;   // written only for valid curves below
         status_sh = J.solved[p] == 1 && J.lens[p] >= 2 ? 1 : 0;
         ctx.world_spheres = J.w_sph + (size_t)p * J.max_w[0] * 4;
         ctx.world_capsules = J.w_cap + (size_t)p * J.max_w[1] * 7;
@@ -96,6 +97,8 @@ __global__ void prrax_spline_kernel(SplineJob J) {
         ctx.enabled = (prrax::n_spheres > 0 && (k[0] > 0.f || k[1] > 0.f || k[2] > 0.f || k[3] > 0.f ||
                                                 prrax::n_self_pairs > 0)) ? 1 : 0;
         ctx.collision_mode = J.collision_mode; ctx.collision_margin = J.collision_margin; ctx.solved = nullptr;
+        // Side b shares side a's world arrays and differs only in its counts: the caller packs one
+        // world whose per-side counts select prefixes of it (crispee's shared prrax_world).
         ctx_b = ctx;
         if (split_v >= 0) {
             const float* kb = J.counts_b + p * 4;

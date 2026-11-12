@@ -1128,7 +1128,12 @@ __device__ void plan_problem(
     int local_iter = 0;
     __shared__ int iters_sh;
     __shared__ int direct_sh;
+    __shared__ int leave_sh;
     __shared__ float root_sh[CONFIG_DIM_MAX];
+    // The block that ran the direct attempt (attempt 0) is the only one that may fail the problem
+    // on budget: an out-of-budget block that did not run it just leaves, so a small budget (1 =
+    // the direct connect only) can never cut the direct attempt short while it is in flight.
+    bool did_direct = false;
 
     while (true) {
         if (stopped()) return;
@@ -1140,12 +1145,18 @@ __device__ void plan_problem(
             const int w = atomicAdd(work, 1);
             direct_sh = (w == 0);
             iters_sh = w / num_new_samples + 1;
+            leave_sh = 0;
             if (w >= max_iterations * num_new_samples) {
-                if (atomicCAS(solved_out, 0, -1) == 0) *t_end = globaltimer_ns();
-                atomicMax(iter_count, max_iterations);
+                if (did_direct) {
+                    if (atomicCAS(solved_out, 0, -1) == 0) *t_end = globaltimer_ns();
+                    atomicMax(iter_count, max_iterations);
+                } else {
+                    leave_sh = 1;
+                }
             }
         }
         __syncthreads();
+        if (leave_sh) return;
         if (stopped()) return;
 
         // --- Attempt 0: the direct connection start root -> goal tree (VAMP RRTC's
@@ -1155,6 +1166,7 @@ __device__ void plan_problem(
             if (tid < dim) root_sh[tid] = tree_a_configs[tid * max_nodes];
             __syncthreads();
             connect_from(0, 0, root_sh, 0.0f);
+            did_direct = true;
             continue;
         }
 
@@ -1493,9 +1505,16 @@ __global__ void prrax_plan_batch_kernel(
         __syncthreads();
         if (threadIdx.x == 0) {
             atomicSub(&L.active[p], 1);
+            // least-active unsolved problem, scanning on from this one and stopping at the first
+            // idle one (none can be less active): a full scan per pick made a launch superlinear
+            // in its batch (2048 edges: 410 us/edge vs 9 us at 256)
             int best = -1, best_n = INT_MAX;
-            for (int q = 0; q < L.batch; ++q) {
+            for (int t = 1; t <= L.batch && best_n > 0; ++t) {
+                const int q = (p + t) % L.batch;
                 if (volatile_load(&L.solved[q]) != 0) continue;
+                // out of budget: only its direct-attempt block may still be on it (it fails the
+                // problem when done); re-entering would just leave again (a spin on work[q])
+                if (volatile_load(&L.work[q]) >= max_iterations * num_new_samples) continue;
                 const int a = volatile_load(&L.active[q]);
                 if (a < best_n) { best_n = a; best = q; }
             }
@@ -1512,6 +1531,9 @@ __global__ void prrax_path_batch_kernel(BatchLayout L, float* __restrict__ path,
                                         float* __restrict__ time_ms, int w1, int max_path) {
     const int p = blockIdx.x;
     const size_t n = L.max_nodes;
+    // only constrained edges store waypoints: an unconstrained problem in a batch that
+    // allocated the waypoint buffer must not expand (unwritten) slots
+    if (L.cons[p * PRRAX_CONS_SIZE + CONS_N] <= 0.0f) w1 = 0;
     trace_path(L.solved + p, L.conn + p * 3, L.ta_cfg + (size_t)p * L.dim * n, L.tb_cfg + (size_t)p * L.dim * n,
                L.ta_par + p * n, L.tb_par + p * n, L.wps_a + p * L.wps_size, L.wps_b + p * L.wps_size,
                path + (size_t)p * max_path * L.dim, path_len + p, L.t_start + p, L.t_end + p, time_ms + p,
@@ -1546,9 +1568,11 @@ __global__ void prrax_shortcut_batch_kernel(
     BatchLayout L, float* __restrict__ path, int* __restrict__ path_len,
     const float* __restrict__ lo, const float* __restrict__ hi, int collision_mode,
     float collision_margin, float step_size, int phase, int max_path,
-    float* __restrict__ seg_buf, int seg_max, int seg_blocks)   // seg_blocks: the largest grid
+    float* __restrict__ seg_buf, int seg_max, int seg_blocks,   // seg_blocks: the largest grid
+    int* __restrict__ queue = nullptr)   // phase 2: (problem, anchor row) items pulled by any block
 {
-    const int p = blockIdx.x % L.batch, sub = blockIdx.x / L.batch, nb = gridDim.x / L.batch;
+    int p = blockIdx.x % L.batch;
+    const int sub = blockIdx.x / L.batch, nb = gridDim.x / L.batch;
     const int tid = threadIdx.x, dim = L.dim, W = blockDim.x / PRRAX_WP_LANES;
     constexpr int KM = PRRAX_SC_ANCHORS;
     __shared__ CollisionContext ctx_sh;
@@ -1558,16 +1582,23 @@ __global__ void prrax_shortcut_batch_kernel(
     __shared__ float wp_sh[PRRTC_BLOCK_THREADS_MAX * CONFIG_DIM_MAX];
     __shared__ float cur_sh[CONFIG_DIM_MAX], tgt_sh[CONFIG_DIM_MAX];
     __shared__ float cc_group_T[(PRRTC_BLOCK_THREADS_MAX / PRRTC_CC_LANES) * PRRTC_CC_MAX_JOINTS * 7];
-    float* P = path + (size_t)p * max_path * dim;
     float* S = seg_buf + (size_t)blockIdx.x * seg_max * dim;
-    float* Q = seg_buf + (size_t)seg_blocks * seg_max * dim + (size_t)p * max_path * dim;
-    float* lens = seg_buf + (size_t)seg_blocks * seg_max * dim + (size_t)L.batch * max_path * dim
-                + (size_t)p * KM * KM;
+    float *P, *Q, *lens;
+    bool constrained = false;
+    float eps = 0.f;
+    const bool queued = phase == 2 && queue != nullptr;
+    // binds problem p_ (collective): its path, scratch, constraints and collision context
+    auto bind = [&](int p_) {
+    __syncthreads();
+    p = p_;
+    P = path + (size_t)p * max_path * dim;
+    Q = seg_buf + (size_t)seg_blocks * seg_max * dim + (size_t)p * max_path * dim;
+    lens = seg_buf + (size_t)seg_blocks * seg_max * dim + (size_t)L.batch * max_path * dim + (size_t)p * KM * KM;
     for (int k = tid; k < PRRAX_CONS_SIZE; k += blockDim.x) cons_sh[k] = L.cons[p * PRRAX_CONS_SIZE + k];
     if (tid == 0) {
         zero_sh = 0;
         len_sh = path_len[p];
-        go_sh = L.solved[p] == 1 && len_sh > 2 && ((phase != 3 && phase != 4) || sub == 0);
+        go_sh = L.solved[p] == 1 && len_sh > 2 && ((phase != 3 && phase != 4) || sub == 0 || queued);
         const float* c = L.counts + p * 4;
         ctx_sh.world_spheres = L.w_sph + (size_t)p * L.max_w[0] * 4;
         ctx_sh.world_capsules = L.w_cap + (size_t)p * L.max_w[1] * 7;
@@ -1584,13 +1615,15 @@ __global__ void prrax_shortcut_batch_kernel(
         ctx_sh.solved = &zero_sh;   // never aborts: the problem is already solved
     }
     __syncthreads();
-    if (!go_sh) return;   // block-uniform
+    constrained = cons_sh[CONS_N] > 0.0f;
+    eps = cons_sh[CONS_CONNECT_EPS];
+    };
+    bind(p);
+    if (!go_sh && !queued) return;   // block-uniform
     const CollisionContext& ctx = ctx_sh;
-    const bool constrained = cons_sh[CONS_N] > 0.0f;
     const bool cc_coop = (collision_mode == 3 && prrax::coarse_enabled
                           && grim::robot::n_frames <= PRRTC_CC_MAX_JOINTS
                           && static_cast<int>(blockDim.x) >= PRRTC_CC_LANES);
-    const float eps = cons_sh[CONS_CONNECT_EPS];
 
     auto dist = [&](const float* a, const float* b) {
         float s2 = 0.f; for (int d = 0; d < dim; ++d) { const float x = a[d] - b[d]; s2 += x * x; }
@@ -1653,8 +1686,8 @@ __global__ void prrax_shortcut_batch_kernel(
         return reached;
     };
 
-    const int n = len_sh;
-    const int K = min(n, KM);
+    int n = len_sh;
+    int K = min(n, KM);
     auto anchor = [&](int k) { return static_cast<int>((static_cast<long long>(k) * (n - 1)) / (K - 1)); };
     auto sub_len = [&](int a, int b) { float l = 0.f; for (int m = a; m < b; ++m) l += dist(P + m * dim, P + (m + 1) * dim); return l; };
 
@@ -1678,6 +1711,38 @@ __global__ void prrax_shortcut_batch_kernel(
         return;
     }
 
+    // the shortcut graph edge (k, l) of the bound problem (phase 2 / 4)
+    auto sc_edge = [&](int k, int l, bool whole) {
+        if (whole) { if (tid == 0) lens[k * KM + l] = FLT_MAX; return; }
+        const int ia = anchor(k), ib = anchor(l);
+        const float *a = P + ia * dim, *b = P + ib * dim;
+        // A shortcut is at least its chord long: skip it if that cannot beat the path.
+        float len = FLT_MAX;
+        if (dist(a, b) < sub_len(ia, ib) && connect_seg(a, b, constrained, k * KM + l)) {
+            // (no steps: a already within eps of b -- S holds an earlier connect's segment)
+            len = nseg_sh > 0 ? dist(a, S) : dist(a, b);
+            for (int m = 0; m + 1 < nseg_sh; ++m) len += dist(S + m * dim, S + (m + 1) * dim);
+        }
+        if (tid == 0) lens[k * KM + l] = len;
+    };
+
+    if (queued) {   // --- phase 2, load-balanced: any block takes the next (problem, row k) ---
+        __shared__ int item_sh;
+        for (int bound = -1;;) {
+            __syncthreads();
+            if (tid == 0) item_sh = atomicAdd(queue, 1);
+            __syncthreads();
+            const int item = item_sh;
+            if (item >= L.batch * KM) return;
+            const int pp = item / KM, k = item % KM;
+            if (pp != bound) { bind(pp); bound = pp; n = len_sh; K = min(n, KM); }
+            if (!go_sh || k >= K) continue;
+            const bool whole = lens[K - 1] < FLT_MAX;
+            for (int l = k + 2; l < K; ++l)
+                if (k * K + l != K - 1) sc_edge(k, l, whole);
+        }
+    }
+
     if (phase == 2 || phase == 4) {   // --- shortcut graph edges ---
         // Phase 4 (first, block 0) tries the whole path; if that connects, the other pairs are
         // left out (phase 2 then only marks them).
@@ -1685,16 +1750,7 @@ __global__ void prrax_shortcut_batch_kernel(
         for (int q = phase == 4 ? K - 1 : sub; q < (phase == 4 ? K : K * K); q += nb) {
             const int k = q / K, l = q % K;
             if (l < k + 2 || (phase == 2 && q == K - 1)) continue;
-            if (whole) { if (tid == 0) lens[k * KM + l] = FLT_MAX; continue; }
-            const int ia = anchor(k), ib = anchor(l);
-            const float *a = P + ia * dim, *b = P + ib * dim;
-            // A shortcut is at least its chord long: skip it if that cannot beat the path.
-            float len = FLT_MAX;
-            if (dist(a, b) < sub_len(ia, ib) && connect_seg(a, b, constrained, k * KM + l)) {
-                len = dist(a, S);
-                for (int m = 0; m + 1 < nseg_sh; ++m) len += dist(S + m * dim, S + (m + 1) * dim);
-            }
-            if (tid == 0) lens[k * KM + l] = len;
+            sc_edge(k, l, whole);
         }
         return;
     }
@@ -1745,56 +1801,83 @@ __global__ void prrax_shortcut_batch_kernel(
     }
 }
 
-// Scratch kept across calls (grow-only): dynamic-domain radii and per-problem counters.
-// ponytail: one process-wide pool, not thread-safe; a mutex or per-device pools if the handler
-// ever runs concurrently.
+// Call-scoped device scratch from XLA's own allocator (the caller-owns-scratch contract): a handler
+// opens a PrraxScratchScope on its ffi::ScratchAllocator and every device temporary below it --
+// here and in callers that launch the planner from their own handler (crispee) -- comes from
+// prrax_scratch(), stream-ordered in XLA's BFC pool and reclaimed when the handler returns. No
+// private cudaMalloc pool competes with XLA's preallocation. A failed allocation returns nullptr
+// and latches prrax_scratch_failed() for the handler to report.
+inline thread_local ffi::ScratchAllocator* prrax_scratch_cur = nullptr;
+inline thread_local bool prrax_scratch_bad = false;
+inline void* prrax_scratch(size_t bytes) {
+    if (!prrax_scratch_cur) { prrax_scratch_bad = true; return nullptr; }
+    auto p = prrax_scratch_cur->Allocate(bytes ? bytes : 16, 16);   // 16 B: always accepted by XLA
+    if (!p.has_value()) { prrax_scratch_bad = true; return nullptr; }
+    return *p;
+}
+inline bool prrax_scratch_failed() { return prrax_scratch_bad; }
+
+// Planner scratch: dynamic-domain radii, per-problem counters, shortcut segments. Grow-only within
+// one scope: a handler that plans many times reuses it (stream order makes reuse safe) instead of
+// taking fresh XLA scratch per call, which XLA only reclaims when the handler returns.
 struct PlannerPool {
-    float* radii = nullptr;
-    size_t radii_size = 0;
+    float* radii = nullptr;  size_t radii_cap = 0;
     int* ints = nullptr;                      // work, active [2, batch]
     unsigned long long* times = nullptr;      // t_start, t_end [2, batch]
     int batch_cap = 0;
-    float* seg = nullptr;                     // shortcut segments [batch, seg_max, dim]
-    size_t seg_size = 0;
+    int* queue = nullptr;                     // shortcut-graph (phase 2) work counter
+    float* seg = nullptr;    size_t seg_cap = 0;   // shortcut segments [batch, seg_max, dim]
     int grid_cap = 0;                         // resident blocks of the planner kernel (whole GPU)
-    int grid_threads = -1;
     cudaError_t reserve(int batch, size_t n_radii, int threads) {
-        if (n_radii > radii_size) {
-            cudaFree(radii);
-            radii_size = 0;
-            const cudaError_t e = cudaMalloc(&radii, sizeof(float) * n_radii);
-            if (e != cudaSuccess) return e;
-            radii_size = n_radii;
+        if (n_radii > radii_cap) {
+            radii = static_cast<float*>(prrax_scratch(sizeof(float) * n_radii));
+            if (!radii) { radii_cap = 0; return cudaErrorMemoryAllocation; }
+            radii_cap = n_radii;
         }
         if (batch > batch_cap) {
-            cudaFree(ints);
-            cudaFree(times);
-            batch_cap = 0;
-            cudaError_t e = cudaMalloc(&ints, sizeof(int) * 2 * batch);
-            if (e == cudaSuccess) e = cudaMalloc(&times, sizeof(unsigned long long) * 2 * batch);
-            if (e != cudaSuccess) return e;
+            ints = static_cast<int*>(prrax_scratch(sizeof(int) * 2 * batch));
+            times = static_cast<unsigned long long*>(prrax_scratch(sizeof(unsigned long long) * 2 * batch));
+            if (!ints || !times) { batch_cap = 0; return cudaErrorMemoryAllocation; }
             batch_cap = batch;
         }
-        if (threads != grid_threads) {
-            int dev = 0, sms = 0, per_sm = 0;
-            cudaGetDevice(&dev);
+        // occupancy depends only on the device and block size: cached per thread
+        static thread_local int cap_dev = -1, cap_threads = -1, cap = 0;
+        int dev = 0;
+        cudaGetDevice(&dev);
+        if (dev != cap_dev || threads != cap_threads) {
+            int sms = 0, per_sm = 0;
             cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
             cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, prrax_plan_batch_kernel, threads, 0);
-            grid_cap = std::max(1, sms * per_sm);
-            grid_threads = threads;
+            cap = std::max(1, sms * per_sm); cap_dev = dev; cap_threads = threads;
         }
+        grid_cap = cap;
         return cudaSuccess;
     }
     cudaError_t reserve_seg(size_t n) {
-        if (n <= seg_size) return cudaSuccess;
-        cudaFree(seg);
-        seg_size = 0;
-        const cudaError_t e = cudaMalloc(&seg, sizeof(float) * n);
-        if (e == cudaSuccess) seg_size = n;
-        return e;
+        if (!queue) queue = static_cast<int*>(prrax_scratch(sizeof(int)));
+        if (n > seg_cap) {
+            seg = static_cast<float*>(prrax_scratch(sizeof(float) * n));
+            seg_cap = seg ? n : 0;
+        }
+        return queue && seg ? cudaSuccess : cudaErrorMemoryAllocation;
     }
 };
-static PlannerPool g_pool;
+inline thread_local PlannerPool* prrax_pool_cur = nullptr;
+
+// Opens a scratch scope; nests (an inner scope's failure also latches the outer one's flag).
+struct PrraxScratchScope {
+    ffi::ScratchAllocator* prev;
+    PlannerPool* prev_pool;
+    bool prev_bad;
+    PlannerPool pool;
+    explicit PrraxScratchScope(ffi::ScratchAllocator& s)
+        : prev(prrax_scratch_cur), prev_pool(prrax_pool_cur), prev_bad(prrax_scratch_bad) {
+        prrax_scratch_cur = &s; prrax_pool_cur = &pool; prrax_scratch_bad = false;
+    }
+    ~PrraxScratchScope() {
+        prrax_scratch_cur = prev; prrax_pool_cur = prev_pool; prrax_scratch_bad = prev_bad || prrax_scratch_bad;
+    }
+};
 
 // Device buffers and settings of one planner launch (see PrrtcPlannerImpl for the layout).
 struct PrraxPlanBuffers {
@@ -1836,6 +1919,8 @@ static cudaError_t prrax_plan_raw(cudaStream_t stream, const float* inputs, cons
     const float* best_in = in;                   // [batch] AO-x cost bound (FLT_MAX: any path, < 0: skip)
     const size_t wps_size = B.wps_size;
     const int max_path = B.max_path;
+    if (!prrax_pool_cur) return cudaErrorInvalidValue;   // no PrraxScratchScope open
+    PlannerPool& g_pool = *prrax_pool_cur;
     cudaError_t e = g_pool.reserve(batch, (size_t)4 * batch * max_nodes, granularity * PRRAX_WP_LANES);
     if (e != cudaSuccess) return e;
 
@@ -1875,9 +1960,11 @@ static cudaError_t prrax_plan_raw(cudaStream_t stream, const float* inputs, cons
                                + (size_t)batch * PRRAX_SC_ANCHORS * PRRAX_SC_ANCHORS);
         if (e != cudaSuccess) return e;
         auto launch = [&](int phase, int g) {
+            if (phase == 2) cudaMemsetAsync(g_pool.queue, 0, sizeof(int), stream);
             prrax_shortcut_batch_kernel<<<g, granularity * PRRAX_WP_LANES, 0, stream>>>(
                 L, B.path, B.path_len, min_in, max_in, collision_mode,
-                collision_margin, step_size, phase, max_path, g_pool.seg, seg_max, grid);
+                collision_margin, step_size, phase, max_path, g_pool.seg, seg_max, grid,
+                phase == 2 ? g_pool.queue : nullptr);
         };
         // Shortcuts first (MR. POP smooths first): smoothing then only checks the few
         // waypoints left, at the same final cost per round.
@@ -1895,6 +1982,7 @@ static cudaError_t prrax_plan_raw(cudaStream_t stream, const float* inputs, cons
 // XLA's stream (setup, persistent planning, path tracing); nothing blocks the host.
 static ffi::Error PrrtcPlannerImpl(
     cudaStream_t stream,
+    ffi::ScratchAllocator scratch,
     // All inputs in one buffer (one host->device copy), in this order: starts [batch, dim],
     // goals [batch, num_goals, dim], min_vals [dim], max_vals [dim], world spheres
     // [batch, mw0, 4], capsules [batch, mw1, 7], boxes [batch, mw2, 15], halfspaces
@@ -1943,6 +2031,7 @@ static ffi::Error PrrtcPlannerImpl(
                         dynamic_domain, dd_alpha, dd_radius, dd_min_radius, max_nodes, granularity,
                         collision_mode, collision_margin, shortcut_rounds, batch, dim, num_goals,
                         {mw0, mw1, mw2, mw3}};
+    PrraxScratchScope scope(scratch);
     const cudaError_t e = prrax_plan_raw(stream, inputs.typed_data(), B, S);
     if (e != cudaSuccess) return ffi::Error(ffi::ErrorCode::kInternal, cudaGetErrorString(e));
     return ffi::Error::Success();
@@ -1952,6 +2041,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
     PrrtcPlannerFfi, PrrtcPlannerImpl,
     ffi::Ffi::Bind()
         .Ctx<ffi::PlatformStream<cudaStream_t>>()
+        .Ctx<ffi::ScratchAllocator>()
         .Arg<ffi::Buffer<ffi::DataType::F32>>()  // packed inputs (see PrrtcPlannerImpl)
         .Ret<ffi::Buffer<ffi::DataType::F32>>()  // tree_a_configs
         .Ret<ffi::Buffer<ffi::DataType::F32>>()  // tree_b_configs
@@ -2133,6 +2223,8 @@ static cudaError_t prrax_simplify_raw(cudaStream_t stream, const float* inputs, 
     const float* w_hs = in;              in += (size_t)batch * mw[3] * 6;
     const float* counts_in = in;         in += (size_t)batch * 4;
     const float* cons_in = in;
+    if (!prrax_pool_cur) return cudaErrorInvalidValue;   // no PrraxScratchScope open
+    PlannerPool& g_pool = *prrax_pool_cur;
     cudaError_t e = g_pool.reserve(batch, 1, granularity * PRRAX_WP_LANES);
     if (e != cudaSuccess) return e;
     BatchLayout L{};
@@ -2148,9 +2240,10 @@ static cudaError_t prrax_simplify_raw(cudaStream_t stream, const float* inputs, 
                            + (size_t)batch * PRRAX_SC_ANCHORS * PRRAX_SC_ANCHORS);
     if (e != cudaSuccess) return e;
     auto launch = [&](int phase, int g) {
+        if (phase == 2) cudaMemsetAsync(g_pool.queue, 0, sizeof(int), stream);
         prrax_shortcut_batch_kernel<<<g, granularity * PRRAX_WP_LANES, 0, stream>>>(
             L, path, path_len, min_in, max_in, collision_mode, collision_margin, step_size, phase,
-            max_path, g_pool.seg, seg_max, grid);
+            max_path, g_pool.seg, seg_max, grid, phase == 2 ? g_pool.queue : nullptr);
     };
     for (int r = 0; r < rounds; ++r) {
         launch(4, batch);
@@ -2163,6 +2256,7 @@ static cudaError_t prrax_simplify_raw(cudaStream_t stream, const float* inputs, 
 
 static ffi::Error PrraxSimplifyImpl(
     cudaStream_t stream,
+    ffi::ScratchAllocator scratch,
     ffi::Buffer<ffi::DataType::F32> inputs,       // see prrax_simplify_raw
     ffi::Buffer<ffi::DataType::F32> path_in,      // [batch, max_path, dim]
     ffi::Buffer<ffi::DataType::S32> len_in,       // [batch]
@@ -2176,6 +2270,7 @@ static ffi::Error PrraxSimplifyImpl(
                     cudaMemcpyDeviceToDevice, stream);
     cudaMemcpyAsync(path_len->typed_data(), len_in.typed_data(), sizeof(int) * batch, cudaMemcpyDeviceToDevice, stream);
     const int mw[4] = {mw0, mw1, mw2, mw3};
+    PrraxScratchScope scope(scratch);
     const cudaError_t e = prrax_simplify_raw(stream, inputs.typed_data(), path->typed_data(), path_len->typed_data(),
                                              max_path, rounds, step_size, granularity, collision_mode,
                                              collision_margin, batch, dim, mw);
@@ -2186,6 +2281,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
     PrraxSimplifyFfi, PrraxSimplifyImpl,
     ffi::Ffi::Bind()
         .Ctx<ffi::PlatformStream<cudaStream_t>>()
+        .Ctx<ffi::ScratchAllocator>()
         .Arg<ffi::Buffer<ffi::DataType::F32>>()   // packed inputs
         .Arg<ffi::Buffer<ffi::DataType::F32>>()   // path_in [batch, max_path, dim]
         .Arg<ffi::Buffer<ffi::DataType::S32>>()   // len_in [batch]
