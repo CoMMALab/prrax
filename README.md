@@ -5,29 +5,67 @@
 
 ## Setup
 
-prrax depends on [pyroffi v1.0](../pyroffi-grim). PyRoFFI vendors a CUDA backend through GRiD and custom motion planning kernels as well as cricket2 (name is wip) which trace compiles CUDA code. 
+Prerequisites: an NVIDIA GPU, the CUDA toolkit (`nvcc`), Python 3.11+, and jax/jaxlib with CUDA.
+
+prrax depends on [pyroffi](https://github.com/commalab/pyroffi) (v1.0, the GRiM version), which is not on
+PyPI. pyroffi provides the robot model, collision spheres and GRiM's trace compiler, which generates the
+robot-specific CUDA code the planner is built from (on first use, per robot).
 
 ```bash
 conda activate prrax
+git clone https://github.com/commalab/pyroffi ../pyroffi-grim
 pip install -e ../pyroffi-grim
-bash ../pyroffi-grim/build_kernels/build_cricket.sh     # installs cricket2 (GRiM's trace compiler)
-ln -sfn ../pyroffi-grim pyroffi                         # resources used by tests/benchmarks
-git submodule update --init                             # mcvamp (benchmark assets), pRRTC (reference)
-pip install -e ".[test]"                                # installs the `prrax` package (from cuda-rrtc/)
+bash ../pyroffi-grim/build_kernels/build_cricket.sh   # GRiM's trace compiler
+ln -sfn ../pyroffi-grim pyroffi                       # robot resources used by tests, demos, benchmarks
+pip install -e ".[test]"                              # the `prrax` package (sources in cuda-rrtc/)
 ```
 
 ```python
 from prrax.jax import prrtc_plan, prrtc_plan_batch
 ```
 
+### Benchmark assets and baselines (optional)
+
+| What | Needed for | How |
+|---|---|---|
+| `mcvamp` checkout | tests, the constrained demos and `benchmark/benchmark_constrained.py` (McVAMP's problem sets, maze, Panda model); files only, no build | `git submodule update --init mcvamp` |
+| McVAMP Python module | live McVAMP comparison in `demos/demo_line_plane.py` and `demos/demo_maze.py`; without it they run prrax alone | `cd mcvamp/vamp && pip install . -C cmake.define.VAMP_ROBOTS="panda"` |
+| `pRRTC` checkout | nothing: the original CUDA pRRTC, for reference | `git submodule update --init pRRTC` |
+
+Demos and benchmarks also use `viser`, `trimesh`, `tqdm`, `pandas` and `loguru`:
+`pip install viser trimesh tqdm pandas loguru`.
+
 ## Tests
 
 ```bash
-pytest   # needs a GPU; the planner is built per robot on first use
+pytest   # needs a GPU and the mcvamp checkout; the planner is built per robot on first use
 ```
 
+## Demos
 
-Prerequisites: CUDA toolkit (`nvcc`), Python 3.11+, jax/jaxlib with CUDA.
+Each demo opens a viser viewer at the printed URL (`--visualize` where it is optional).
+
+```bash
+python demos/demo_prrtc.py                         # unconstrained pRRTC; tree and path viewer
+python demos/batched_solve_demo.py                 # many problems in one batched solve
+python demos/demo_line_plane.py --problems plane --visualize   # end effector on a plane (or --problems line)
+python demos/demo_maze.py [--hard]                 # marker tip on the table through the maze; drag the red sphere
+```
+
+With the McVAMP module installed, `demo_line_plane.py` and `demo_maze.py` also solve every problem with McVAMP
+(one CPU core) and print both times; `--no-mcvamp` turns that off. In the maze, McVAMP plans on its own model
+(Panda with a pen, constraint on the hand), so the problems are close but not identical.
+
+## Benchmarks
+
+```bash
+python benchmark/evaluate_mbm.py                   # MotionBenchMaker problems (pyroffi resources)
+python benchmark/evaluate_mbm_batched.py           # the same, batched per problem set
+python benchmark/benchmark_constrained.py --problems plane [--mode mcvamp|cprrtc]   # needs the mcvamp checkout
+python benchmark/benchmark_collision_checkers.py   # the planner's collision checkers compared
+```
+
+Use `CUDA_VISIBLE_DEVICES` to pick a GPU and `XLA_PYTHON_CLIENT_PREALLOCATE=false` when sharing one.
 
 
 ## References
