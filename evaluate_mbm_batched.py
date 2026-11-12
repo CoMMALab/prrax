@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import importlib.util
 import json
 import pickle
 import sys
@@ -66,7 +65,6 @@ from pyroffi.collision._robot_collision import RobotCollisionSpherized
 
 ROOT = Path(__file__).resolve().parent
 RESOURCES = ROOT / "pyroffi" / "resources"
-PRRTC_ROOT = ROOT / "cuda-rrtc" / "jax"
 SOLVE_BATCH_CHUNK_SIZE = 25
 STEP_SIZE_BY_ROBOT = {
     "panda": 0.5,
@@ -75,17 +73,7 @@ STEP_SIZE_BY_ROBOT = {
 }
 
 
-def _load_module(module_name: str, module_path: Path):
-    spec = importlib.util.spec_from_file_location(module_name, module_path)
-    if spec is None or spec.loader is None:
-        raise RuntimeError(f"Failed to load module from {module_path}")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
-PRRTC = _load_module("cuda_rrtc_prrtc", PRRTC_ROOT / "prrtc.py")
-PRRTC_UTILS = _load_module("cuda_rrtc_utils", PRRTC_ROOT / "utils.py")
+from prrax.jax import prrtc as PRRTC, utils as PRRTC_UTILS
 
 
 def load_robot_dataset(robot: str) -> dict[str, Any]:

@@ -20,7 +20,6 @@ Usage::
 from __future__ import annotations
 
 import argparse
-import importlib.util
 import pickle
 import sys
 from pathlib import Path
@@ -44,23 +43,11 @@ from pyroffi.collision._robot_collision import RobotCollisionSpherized
 
 ROOT = Path(__file__).resolve().parent
 RESOURCES = ROOT / "pyroffi" / "resources"
-PRRTC_ROOT = ROOT / "cuda-rrtc" / "jax"
 
 STEP_SIZE_BY_ROBOT = {"panda": 0.5, "fetch": 0.6, "baxter": 0.25}
 
 
-def _load_module(name: str, path: Path):
-    spec = importlib.util.spec_from_file_location(name, path)
-    if spec is None or spec.loader is None:
-        raise ImportError(f"cannot load {name} from {path}")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[name] = module
-    spec.loader.exec_module(module)
-    return module
-
-
-PRRTC = _load_module("prrtc_mod", PRRTC_ROOT / "prrtc.py")
-PRRTC_UTILS = _load_module("prrtc_utils_mod", PRRTC_ROOT / "utils.py")
+from prrax.jax import prrtc as PRRTC, utils as PRRTC_UTILS
 
 
 def load_dataset(robot: str) -> dict[str, Any]:

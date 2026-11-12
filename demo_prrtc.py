@@ -4,7 +4,6 @@ Test script for pRRTC with a VAMP problem from pyroffi.
 """
 
 import sys
-import importlib.util
 import argparse
 import time
 from pathlib import Path
@@ -12,41 +11,13 @@ import jax.numpy as jnp
 import numpy as np
 
 # Import pyroffi
-try:
-    import pyroffi as pk
-    import yourdfpy
-    from pyroffi.collision._obstacles import create_collision_environment
-    from pyroffi.collision._robot_collision import RobotCollisionSpherized
-except ImportError as e:
-    print(f"Import error: {e}")
-    print("Please install pyroffi and yourdfpy")
-    sys.exit(1)
+import pyroffi as pk
+import yourdfpy
+from pyroffi.collision._obstacles import create_collision_environment
+from pyroffi.collision._robot_collision import RobotCollisionSpherized
 
-# Import cuda-rrtc
-try:
-    prrtc_impl = Path(__file__).parent / "cuda-rrtc" / "jax" / "prrtc.py"
-    spec = importlib.util.spec_from_file_location("cuda_rrtc_prrtc", prrtc_impl)
-    if spec is None or spec.loader is None:
-        raise ImportError(f"Failed to load module spec from {prrtc_impl}")
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    prrtc_plan = mod.prrtc_plan
-    prrtc_plan_batch = mod.prrtc_plan_batch
-
-    utils_impl = Path(__file__).parent / "cuda-rrtc" / "jax" / "utils.py"
-    utils_spec = importlib.util.spec_from_file_location("cuda_rrtc_utils", utils_impl)
-    if utils_spec is None or utils_spec.loader is None:
-        raise ImportError(f"Failed to load module spec from {utils_impl}")
-    utils_mod = importlib.util.module_from_spec(utils_spec)
-    utils_spec.loader.exec_module(utils_mod)
-
-    load_vamp_problem = utils_mod.load_vamp_problem
-    build_prrtc_collision_context = utils_mod.build_prrtc_collision_context
-    config_collision_report = utils_mod.config_collision_report
-except Exception as e:
-    print(f"cuda-rrtc import error: {e}")
-    print("The planner is built per robot on first use (needs nvcc, pyroffi-grim with GRiM and cricket2).")
-    sys.exit(1)
+from prrax.jax import prrtc_plan, prrtc_plan_batch
+from prrax.jax.utils import load_vamp_problem, build_prrtc_collision_context, config_collision_report
 
 
 RESOURCE_ROOT = Path(__file__).resolve().parent / "pyroffi" / "resources"
