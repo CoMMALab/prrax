@@ -67,8 +67,9 @@ def main() -> None:
     ap.add_argument("--hard", action="store_true", help="crispee's curated problem across the whole maze")
     ap.add_argument("--no-mcvamp", action="store_true", help="do not also run McVAMP (when installed)")
     ap.add_argument("--fps", type=float, default=60.0)
-    ap.add_argument("--shortcut-rounds", type=int, default=1,
-                    help="MR. POP simplification rounds per plan (mcvamp simplifies; ~10 ms each in the maze, 0 = off)")
+    ap.add_argument("--simplify-rounds", type=int, default=1,
+                    help="simplification rounds per plan (B-spline smoothing + shortcutting), prrax and McVAMP alike "
+                         "(~10 ms each in the maze, 0 = off for both)")
     args = ap.parse_args()
 
     import pyroffi as pk
@@ -121,7 +122,8 @@ def main() -> None:
     # McVAMP: the latest replan request, solved on a worker thread (stale requests are dropped).
     mc_req, mc_cond = [None], threading.Condition()
     if mcvamp_side.AVAILABLE and not args.no_mcvamp:
-        mcv = mcvamp_side.McVamp(0.2, max_iterations=100_000, seed_iterations=50)
+        mcv = mcvamp_side.McVamp(0.2, max_iterations=100_000, seed_iterations=50,
+                                 simplify_rounds=args.simplify_rounds)
         mc_cuboids = [((o["x"], o["y"], o["z"]), (o["dx"] / 2, o["dy"] / 2, o["dz"] / 2)) for o in cub]
         mc_elapsed = server.gui.add_number("McVAMP (ms)", 0.001, disabled=True)
 
@@ -169,7 +171,7 @@ def main() -> None:
             elapsed.value = (time.perf_counter() - t1) * 1e3
             print(f"Not planned: the obstacle hits the {' and '.join(n for n, h in zip(('start', 'goal'), hit) if h)}")
             return
-        r = P.prrtc_plan(start[0], goal[None], collision_context=ctx, shortcut_rounds=args.shortcut_rounds, **plan_kw)
+        r = P.prrtc_plan(start[0], goal[None], collision_context=ctx, shortcut_rounds=args.simplify_rounds, **plan_kw)
         new = np.asarray(r.path, np.float32) if r.solved else start
         with lock:
             st["traj"], st["t"] = new, 0.0

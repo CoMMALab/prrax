@@ -16,11 +16,15 @@ except ImportError:
 
 
 class McVamp:
-    """knobs: ConstraintSettings fields for planning (None: McVAMP's defaults)."""
+    """knobs: ConstraintSettings fields for planning (None: McVAMP's defaults). simplify_rounds:
+    simplify's max_iterations (None: McVAMP's default; 0: no simplification)."""
 
-    def __init__(self, range_: float, max_iterations: int, seed_iterations: int, knobs: dict | None = None):
+    def __init__(self, range_: float, max_iterations: int, seed_iterations: int, knobs: dict | None = None,
+                 simplify_rounds: int | None = None):
         self.module, self.plan, self.plan_settings, self.simp_settings = (
             vamp.configure_robot_and_planner_with_kwargs("panda", "rrtc"))
+        if simplify_rounds is not None:
+            self.simp_settings.max_iterations = int(simplify_rounds)
         self.plan_settings.range = range_
         self.plan_settings.dynamic_domain = False
         self.plan_settings.max_iterations = max_iterations
@@ -59,7 +63,7 @@ class McVamp:
         if not r.solved:
             return dict(status=f"no path after {r.iterations} iterations", plan_ms=r.nanoseconds / 1e6)
         simple, simp_ms = r, 0.0
-        if len(r.path) > simplify_min:
+        if self.simp_settings.max_iterations > 0 and len(r.path) > simplify_min:
             simple = m.simplify(r.path, env, self.simp_settings, sampler, constraints=cons,
                                 constraint_settings=self.settings)
             simp_ms = simple.nanoseconds / 1e6
