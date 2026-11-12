@@ -15,8 +15,13 @@ path is simplified. --visualize shows the first solved problem the way the page 
 in the page's palette, the constraint as a green slab, the end-effector path as copper spheres
 (red start, magenta goal), a label and the page's camera; the path is on a waypoint slider.
 
+If McVAMP's Python module is installed (pip install . in mcvamp/vamp), every problem is also solved
+by McVAMP with McVAMP's own settings (one CPU core) and the times are printed side by side;
+--no-mcvamp skips it.
+
     python demos/demo_line_plane.py [--problems plane|line] [--keep-orientation] [--visualize]
                                     [--first I] [--limit N] [--range 1.0] [--shortcut-rounds 1]
+                                    [--no-mcvamp]
 """
 
 from __future__ import annotations
@@ -36,6 +41,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "benchmark"))
 sys.path.insert(0, str(ROOT / "mcvamp" / "experiments" / "python"))
 import benchmark_constrained as B  # noqa: E402
+import mcvamp_side  # noqa: E402
 
 P = B.PRRTC
 VAMP_PANDA = ROOT / "mcvamp" / "vamp" / "resources" / "panda"
@@ -65,7 +71,16 @@ def main() -> None:
     ap.add_argument("--range", type=float, default=1.0, help="extension step (McVAMP's range_)")
     ap.add_argument("--shortcut-rounds", type=int, default=1, help="simplification (McVAMP simplifies)")
     ap.add_argument("--visualize", action="store_true", help="show the first solved problem in viser")
+    ap.add_argument("--no-mcvamp", action="store_true", help="do not also run McVAMP (when installed)")
     args = ap.parse_args()
+    mcv = None
+    if mcvamp_side.AVAILABLE and not args.no_mcvamp:
+        # benchmark_line_plane.py's knobs (benchmark_common.Knobs)
+        mcv = mcvamp_side.McVamp(args.range, max_iterations=200_000, seed_iterations=200, knobs=dict(
+            method="OuterLM", descend_rate=1.0, max_iterations=15, emit_all_waypoints=True,
+            perturbation_scale=0.1))
+    elif not args.no_mcvamp:
+        print("McVAMP not installed (pip install . in mcvamp/vamp): prrax only", flush=True)
 
     robot, coll = B.load_panda()
     base_ctx = B.make_context(robot, coll, maze=False)
@@ -88,6 +103,7 @@ def main() -> None:
 
     print(f"line/plane problems ({source}): cpRRTC, problems {names}", flush=True)
     times_ms, iterations, costs = [], [], []
+    mc_ms, mc_costs, mc_attempted = [], [], 0
     attempted = off_manifold = 0
     shown = None
     warm = False
@@ -127,6 +143,19 @@ def main() -> None:
         off_manifold += 0 if on_manifold else 1
         print(f"problem {name} ({n_obs} obstacles): solved in {ms:.3f} ms, {r.iterations} iterations, "
               f"simplified cost {cost:.4f}", flush=True)
+        if mcv is not None:
+            mc_attempted += 1
+            m = mcv.solve(p["start"], p["goal"], [(b[:3], b[12:15]) for b in p["boxes"]], p["tsr"])
+            if m["status"] != "solved":
+                print(f"    McVAMP: {m['status']}", flush=True)
+            else:
+                tot = m["plan_ms"] + m["simplify_ms"]
+                mc_ms.append(tot)
+                mc_costs.append(m["cost"])
+                print(f"    McVAMP: solved in {tot:.3f} ms ({m['plan_ms']:.3f} plan + {m['simplify_ms']:.3f} "
+                      f"simplify), {m['iterations']} iterations, simplified cost {m['cost']:.4f}; "
+                      + (f"prrax {tot / ms:.1f}x faster" if tot > ms else f"McVAMP {ms / tot:.1f}x faster"),
+                      flush=True)
         if shown is None:
             shown = (name, p, path)
 
@@ -142,6 +171,10 @@ def main() -> None:
         print(f"Median iterations for successful problems: {int(statistics.median(iterations))}")
         print(f"Mean simplified path cost: {statistics.mean(costs):.4f}")
         print(f"Paths with a waypoint off the manifold: {off_manifold}", flush=True)
+    if mcv is not None:
+        print(f"McVAMP (1 CPU core, plan + simplify): {len(mc_ms)}/{mc_attempted} solved", end="")
+        print(f", median {statistics.median(mc_ms):.4f} ms, mean cost {statistics.mean(mc_costs):.4f}"
+              if mc_ms else "", flush=True)
 
     if not args.visualize:
         return

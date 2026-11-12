@@ -8,7 +8,12 @@ the table plane (z = 0.04, tilt +-0.01 rad, yaw free: crispee's/VAMP's marker ma
 the rest of the current path is re-checked against it and, if blocked, cpRRTC replans from
 where the arm is. Playback is geometric, a fixed time per waypoint (no dynamics), at 60 fps.
 
-    python demos/demo_maze.py [--waypoint-dt 0.1] [--planner-hz 10]
+If McVAMP's Python module is installed (pip install . in mcvamp/vamp), each replan is also handed to
+McVAMP (one CPU core, its own thread, so it never delays prrax) on McVAMP's own maze model: the
+plain Panda with its 10-sphere pen and its hand TSR (pen tip on the table), settings of
+viser_dynamic_obstacle_avoid.py. Its time is shown next to prrax's; --no-mcvamp skips it.
+
+    python demos/demo_maze.py [--hard] [--waypoint-dt 0.01] [--planner-hz 10] [--no-mcvamp]
 """
 
 from __future__ import annotations
@@ -28,6 +33,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "benchmark"))
 sys.path.insert(0, str(ROOT / "mcvamp" / "experiments" / "python"))
 import benchmark_constrained as B  # noqa: E402
+import mcvamp_side  # noqa: E402
 from viser_utils import setup_viser_with_robot  # noqa: E402
 
 P, U = B.PRRTC, B.UTILS
@@ -43,16 +49,26 @@ TSR = ([0.0, 0.0, 0.7071068, 0.7071068, 0.6, 0.3, TIP_Z],
 # maze results are on (39 ms there; prrax ~8 ms). The curated sets pick hard problems (~2 s).
 GOALS = np.asarray([[0.740415, 0.892249, -1.1401451, -1.8482553, 0.9408859, 2.0794082, 2.9670999],
                     [0.3952203, 0.7529666, 0.2910529, -1.4438856, -0.2262138, 2.1491058, 0.7215207]], np.float32)
+# --hard: crispee's tsr_panda_marker_maze_problems_curated_100.json problem 0, across the whole
+# maze (tip y 0.35 -> -0.46).
+HARD_GOALS = np.asarray([[2.5562892, -1.5311456, -1.5348423, -2.021972, -1.519433, 1.555756, -1.1147763],
+                         [2.0414813, -1.0720757, -2.359721, -1.1092368, -0.7198169, 1.9229773, 0.6187202]], np.float32)
 OBSTACLE_RADIUS = 0.05
+# McVAMP's maze model (viser_dynamic_obstacle_avoid.py): TSR on the hand, 10-sphere pen.
+MCVAMP_TSR = ([1, 0, 0, 0, 0, 0, 0], [0, 1.0, 0, 0.0, 0.29276255, -0.55347496, 0.20607783],
+              [-10.01, -10.01, -0.01, -0.01, -0.01, -10.01], [10.01, 10.01, 0.01, 0.01, 0.01, 10.01])
+MCVAMP_PEN = [((0.0, 0.0, z), 0.01) for z in np.linspace(0.0, 0.16, 10)]
 
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--waypoint-dt", type=float, default=0.1, help="seconds per path waypoint")
+    ap.add_argument("--waypoint-dt", type=float, default=0.01, help="seconds per path waypoint")
     ap.add_argument("--planner-hz", type=float, default=10.0)
+    ap.add_argument("--hard", action="store_true", help="crispee's curated problem across the whole maze")
+    ap.add_argument("--no-mcvamp", action="store_true", help="do not also run McVAMP (when installed)")
     ap.add_argument("--fps", type=float, default=60.0)
     ap.add_argument("--shortcut-rounds", type=int, default=1,
-                    help="MR. POP simplification rounds per plan (mcvamp simplifies; ~100 ms each, 0 = off)")
+                    help="MR. POP simplification rounds per plan (mcvamp simplifies; ~10 ms each in the maze, 0 = off)")
     args = ap.parse_args()
 
     import pyroffi as pk
@@ -79,7 +95,7 @@ def main() -> None:
         err, qp, ok = P.constraint_error(base_ctx, [con], q, proj._replace(iters=50), lo, hi)
         return np.where((err <= proj.tol)[:, None], np.atleast_2d(q), qp), ok | (err <= proj.tol)
 
-    goals, ok = project(GOALS)
+    goals, ok = project(HARD_GOALS if args.hard else GOALS)
     assert ok.all(), "goal projection failed"
     tip_pos = jax.jit(lambda q: robot.forward_kinematics(q)[:, tip, 4:7])
     import trimesh
@@ -101,6 +117,33 @@ def main() -> None:
     obstacle = server.scene.add_transform_controls("/obstacle", scale=0.2, position=(0.7, 0.0, 0.5))
     server.scene.add_icosphere("/obstacle/mesh", radius=OBSTACLE_RADIUS, color=(255, 0, 0))
     elapsed = server.gui.add_number("Elapsed (ms)", 0.001, disabled=True)
+
+    # McVAMP: the latest replan request, solved on a worker thread (stale requests are dropped).
+    mc_req, mc_cond = [None], threading.Condition()
+    if mcvamp_side.AVAILABLE and not args.no_mcvamp:
+        mcv = mcvamp_side.McVamp(0.2, max_iterations=100_000, seed_iterations=50)
+        mc_cuboids = [((o["x"], o["y"], o["z"]), (o["dx"] / 2, o["dy"] / 2, o["dz"] / 2)) for o in cub]
+        mc_elapsed = server.gui.add_number("McVAMP (ms)", 0.001, disabled=True)
+
+        def mcvamp_loop() -> None:
+            while True:
+                with mc_cond:
+                    while mc_req[0] is None:
+                        mc_cond.wait()
+                    (start, goal, obs, prrax_ms), mc_req[0] = mc_req[0], None
+                m = mcv.solve(start, goal, mc_cuboids, MCVAMP_TSR, spheres=[(obs, OBSTACLE_RADIUS)],
+                              attachment=MCVAMP_PEN, simplify_min=3)
+                if m["status"] != "solved":
+                    print(f"    McVAMP: {m['status']}")
+                    continue
+                tot = m["plan_ms"] + m["simplify_ms"]
+                mc_elapsed.value = tot
+                print(f"    McVAMP: planned in {tot:.2f} ms ({m['plan_ms']:.2f} plan + {m['simplify_ms']:.2f} "
+                      f"simplify) vs prrax {prrax_ms:.2f} ms")
+
+        threading.Thread(target=mcvamp_loop, daemon=True).start()
+    elif not args.no_mcvamp:
+        print("McVAMP not installed (pip install . in mcvamp/vamp): prrax only")
 
     lock = threading.Lock()
     st = dict(traj=goals[:1], t=0.0, goal=1, q=goals[0])
@@ -136,6 +179,9 @@ def main() -> None:
                   f"cur_obstacle={np.asarray(obstacle.position)}")
             return
         print(f"Planned trajectory with {len(new)} waypoints in {elapsed.value:.2f} mseconds")
+        with mc_cond:   # the same start and goal for McVAMP
+            mc_req[0] = (start[0], goal, np.asarray(obstacle.position, np.float32), elapsed.value)
+            mc_cond.notify()
         # The listener's waypoint spheres, at the marker tip: one instanced mesh, replaced whole.
         pts = np.asarray(tip_pos(jnp.asarray(new)), np.float32)
         server.scene.add_batched_meshes_trimesh("/trajectory_waypoints", dot, np.tile([1.0, 0, 0, 0], (len(pts), 1)),
