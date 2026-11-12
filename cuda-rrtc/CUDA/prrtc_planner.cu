@@ -1548,20 +1548,26 @@ __global__ void prrax_path_batch_kernel(BatchLayout L, float* __restrict__ path,
 //   0 / 1  smoothing of the odd / even interior waypoints (independent given their neighbours):
 //          one moves to 1/4 prev + 1/2 self + 1/4 next (projected when constrained) if that is
 //          shorter and both new chords are collision-free;
+//   4      (one block per problem) resets the shortcut graph's bookkeeping;
 //   2      shortcut graph: every pair of up to PRRAX_SC_ANCHORS evenly spaced anchor waypoints
 //          whose chord is shorter than the path between them is an edge if the planner's own
 //          connect (straight steps, or projected steps when constrained; each step's W
-//          waypoints checked like a tree edge) reaches one from the other: lens [K, K];
-//          (after phase 4: the whole path, block 0 of each problem);
-//   3      (block 0 of each problem) shortest path over those edges and the original sub-paths
-//          between consecutive anchors; the path is rebuilt (a constrained shortcut is
-//          re-connected with the same seed, reproducing its segment).
-// gridDim.x = batch * blocks per problem; phases 0-2 spread their work over a problem's blocks
-// (MR. POP: 16 blocks and grid syncs). scratch: seg [grid, seg_max, dim] (one connect per
-// block), rebuilt paths [batch, max_path, dim], lens [batch, K, K].
+//          waypoints checked like a tree edge) reaches one from the other, no longer than that
+//          path: lens [K, K]. One edge per work item, longest spans first, pulled by any block;
+//          an edge inside an already connected longer one is skipped;
+//   3      (one block per problem) shortest path over those edges and the original sub-paths
+//          between consecutive anchors, with each piece's offset in the rebuilt path;
+//   5      the pieces are written into the rebuilt path in parallel (a constrained shortcut is
+//          re-connected with the same seed, reproducing its segment);
+//   6      (one block per problem) the rebuilt path replaces the old one.
+// gridDim.x = batch * blocks per problem for phases 0, 1, 2, 5. scratch: seg [grid, seg_max, dim]
+// (one connect per block), rebuilt paths [batch, max_path, dim], lens [batch, K, K], then
+// PRRAX_SC_INTS ints per problem.
 #ifndef PRRAX_SC_ANCHORS
 #define PRRAX_SC_ANCHORS 64
 #endif
+// per problem: segment lengths [K, K], reach [K], chain [K], offsets [K], n_chain, q_len, fail
+#define PRRAX_SC_INTS (PRRAX_SC_ANCHORS * PRRAX_SC_ANCHORS + 3 * PRRAX_SC_ANCHORS + 3)
 #define PRRAX_BSPLINE_STEPS 3          // MR. POP's bspline_step
 #define PRRAX_BSPLINE_MIN_CHANGE 0.01f // MR. POP's bspline_min_change
 __global__ void prrax_shortcut_batch_kernel(
@@ -1569,7 +1575,7 @@ __global__ void prrax_shortcut_batch_kernel(
     const float* __restrict__ lo, const float* __restrict__ hi, int collision_mode,
     float collision_margin, float step_size, int phase, int max_path,
     float* __restrict__ seg_buf, int seg_max, int seg_blocks,   // seg_blocks: the largest grid
-    int* __restrict__ queue = nullptr)   // phase 2: (problem, anchor row) items pulled by any block
+    int* __restrict__ queue = nullptr)   // phase 2: (problem, edge) items pulled by any block
 {
     int p = blockIdx.x % L.batch;
     const int sub = blockIdx.x / L.batch, nb = gridDim.x / L.batch;
@@ -1577,6 +1583,7 @@ __global__ void prrax_shortcut_batch_kernel(
     constexpr int KM = PRRAX_SC_ANCHORS;
     __shared__ CollisionContext ctx_sh;
     __shared__ int zero_sh, cflag_sh, any_sh, nseg_sh, len_sh, go_sh;
+    __shared__ float seglen_sh;
     __shared__ float mid_sh[CONFIG_DIM_MAX];
     __shared__ float cons_sh[PRRAX_CONS_SIZE];
     __shared__ float wp_sh[PRRTC_BLOCK_THREADS_MAX * CONFIG_DIM_MAX];
@@ -1584,6 +1591,7 @@ __global__ void prrax_shortcut_batch_kernel(
     __shared__ float cc_group_T[(PRRTC_BLOCK_THREADS_MAX / PRRTC_CC_LANES) * PRRTC_CC_MAX_JOINTS * 7];
     float* S = seg_buf + (size_t)blockIdx.x * seg_max * dim;
     float *P, *Q, *lens;
+    int *nsegs, *reach, *chain, *offs, *tail;   // tail: n_chain, q_len, fail
     bool constrained = false;
     float eps = 0.f;
     const bool queued = phase == 2 && queue != nullptr;
@@ -1594,11 +1602,13 @@ __global__ void prrax_shortcut_batch_kernel(
     P = path + (size_t)p * max_path * dim;
     Q = seg_buf + (size_t)seg_blocks * seg_max * dim + (size_t)p * max_path * dim;
     lens = seg_buf + (size_t)seg_blocks * seg_max * dim + (size_t)L.batch * max_path * dim + (size_t)p * KM * KM;
+    nsegs = reinterpret_cast<int*>(lens - (size_t)p * KM * KM + (size_t)L.batch * KM * KM) + (size_t)p * PRRAX_SC_INTS;
+    reach = nsegs + KM * KM; chain = reach + KM; offs = chain + KM; tail = offs + KM;
     for (int k = tid; k < PRRAX_CONS_SIZE; k += blockDim.x) cons_sh[k] = L.cons[p * PRRAX_CONS_SIZE + k];
     if (tid == 0) {
         zero_sh = 0;
         len_sh = path_len[p];
-        go_sh = L.solved[p] == 1 && len_sh > 2 && ((phase != 3 && phase != 4) || sub == 0 || queued);
+        go_sh = L.solved[p] == 1 && len_sh > 2 && (phase <= 2 || phase == 5 || sub == 0);
         const float* c = L.counts + p * 4;
         ctx_sh.world_spheres = L.w_sph + (size_t)p * L.max_w[0] * 4;
         ctx_sh.world_capsules = L.w_cap + (size_t)p * L.max_w[1] * 7;
@@ -1633,9 +1643,12 @@ __global__ void prrax_shortcut_batch_kernel(
     // `project`, else straight; every step's W waypoints collision-checked (chords from the
     // previous waypoint). Collective. True if it reached b; the segment (b exact at its end) is
     // S[0, nseg_sh). seed: the projection's perturbation stream (a repeat reproduces the segment).
-    auto connect_seg = [&](const float* a, const float* b, bool project, unsigned seed) -> bool {
+    // Gives up once the segment so far plus its chord to b reaches max_len (it cannot be shorter).
+    auto connect_seg = [&](const float* a, const float* b, bool project, unsigned seed,
+                           float max_len = FLT_MAX) -> bool {
         if (tid == 0) {
             nseg_sh = 0;
+            seglen_sh = 0.f;
             for (int d = 0; d < dim; ++d) { cur_sh[d] = a[d]; tgt_sh[d] = b[d]; }
         }
         __syncthreads();
@@ -1657,8 +1670,14 @@ __global__ void prrax_shortcut_batch_kernel(
                             cur_sh[d] + f * (static_cast<float>(tid + 1) / W) * (tgt_sh[d] - cur_sh[d]);
                 __syncthreads();
             }
-            if (tid == 0) any_sh = 0;
+            if (tid == 0) {   // length bound first: cheaper than the collision check
+                float l = seglen_sh + dist(cur_sh, wp_sh);
+                for (int w = 1; w < W; ++w) l += dist(wp_sh + (w - 1) * CONFIG_DIM_MAX, wp_sh + w * CONFIG_DIM_MAX);
+                seglen_sh = l;
+                any_sh = l + dist(wp_sh + (W - 1) * CONFIG_DIM_MAX, tgt_sh) >= max_len;
+            }
             __syncthreads();
+            if (any_sh) break;
             if (cc_coop) {
                 prrtc_edge_cc_cooperative(cur_sh, cur_sh, dim, W, ctx, cc_group_T, &any_sh, wp_sh,
                                           constrained ? cons_sh : nullptr, lo, hi);
@@ -1711,93 +1730,103 @@ __global__ void prrax_shortcut_batch_kernel(
         return;
     }
 
-    // the shortcut graph edge (k, l) of the bound problem (phase 2 / 4)
-    auto sc_edge = [&](int k, int l, bool whole) {
-        if (whole) { if (tid == 0) lens[k * KM + l] = FLT_MAX; return; }
-        const int ia = anchor(k), ib = anchor(l);
-        const float *a = P + ia * dim, *b = P + ib * dim;
-        // A shortcut is at least its chord long: skip it if that cannot beat the path.
-        float len = FLT_MAX;
-        if (dist(a, b) < sub_len(ia, ib) && connect_seg(a, b, constrained, k * KM + l)) {
-            // (no steps: a already within eps of b -- S holds an earlier connect's segment)
-            len = nseg_sh > 0 ? dist(a, S) : dist(a, b);
-            for (int m = 0; m + 1 < nseg_sh; ++m) len += dist(S + m * dim, S + (m + 1) * dim);
-        }
-        if (tid == 0) lens[k * KM + l] = len;
-    };
+    if (phase == 4) {   // --- reset: nothing reached yet ---
+        for (int k = tid; k < KM; k += blockDim.x) reach[k] = -1;
+        return;
+    }
 
-    if (queued) {   // --- phase 2, load-balanced: any block takes the next (problem, row k) ---
-        __shared__ int item_sh;
+    if (phase == 2) {   // --- shortcut graph: any block takes the next (problem, edge (k, l)) ---
+        // One edge per item, longest spans first: a projected connect costs milliseconds, so
+        // handing out whole rows serialised a row's ~K connects in one block.
+        __shared__ int item_sh, skip_sh;
         for (int bound = -1;;) {
             __syncthreads();
             if (tid == 0) item_sh = atomicAdd(queue, 1);
             __syncthreads();
             const int item = item_sh;
-            if (item >= L.batch * KM) return;
-            const int pp = item / KM, k = item % KM;
+            if (item >= L.batch * KM * KM) return;
+            const int pp = item / (KM * KM), j = item % (KM * KM);
+            const int span = KM - 1 - j / KM, k = j % KM, l = k + span;
+            if (span < 2 || l >= KM) continue;   // block-uniform, before binding
             if (pp != bound) { bind(pp); bound = pp; n = len_sh; K = min(n, KM); }
-            if (!go_sh || k >= K) continue;
-            const bool whole = lens[K - 1] < FLT_MAX;
-            for (int l = k + 2; l < K; ++l)
-                if (k * K + l != K - 1) sc_edge(k, l, whole);
+            if (!go_sh || l >= K) continue;
+            const int ia = anchor(k), ib = anchor(l);
+            const float *a = P + ia * dim, *b = P + ib * dim;
+            const float orig = sub_len(ia, ib);
+            // ponytail: skipping edges inside a connected longer edge can miss a shorter
+            // combination (rare: the longer edge already beats the path); evaluate all if it matters.
+            if (tid == 0) {
+                const volatile int* rv = reach;
+                int covered = 0;
+                for (int k2 = 0; k2 <= k && !covered; ++k2) covered = rv[k2] >= l;
+                skip_sh = covered || dist(a, b) >= orig;
+            }
+            __syncthreads();
+            float len = FLT_MAX;
+            // A shortcut is at least its chord long: skip it if that cannot beat the path.
+            if (!skip_sh && connect_seg(a, b, constrained, k * KM + l, orig)) {
+                // (no steps: a already within eps of b -- S holds an earlier connect's segment)
+                len = nseg_sh > 0 ? dist(a, S) : dist(a, b);
+                for (int m = 0; m + 1 < nseg_sh; ++m) len += dist(S + m * dim, S + (m + 1) * dim);
+                if (tid == 0) atomicMax(reach + k, l);
+            }
+            if (tid == 0) { lens[k * KM + l] = len; nsegs[k * KM + l] = nseg_sh; }
         }
     }
 
-    if (phase == 2 || phase == 4) {   // --- shortcut graph edges ---
-        // Phase 4 (first, block 0) tries the whole path; if that connects, the other pairs are
-        // left out (phase 2 then only marks them).
-        const bool whole = phase == 2 && lens[K - 1] < FLT_MAX;
-        for (int q = phase == 4 ? K - 1 : sub; q < (phase == 4 ? K : K * K); q += nb) {
-            const int k = q / K, l = q % K;
-            if (l < k + 2 || (phase == 2 && q == K - 1)) continue;
-            sc_edge(k, l, whole);
+    // a chain piece (k, l): its waypoint count in the rebuilt path (a shortcut: its end; a
+    // constrained one: its segment; else the original sub-path)
+    auto piece = [&](int k, int l) {
+        return l > k + 1 ? (constrained ? nsegs[k * KM + l] : 1) : anchor(l) - anchor(k); };
+
+    if (phase == 3) {   // --- shortest path over the anchors; pieces' offsets in the rebuilt path ---
+        __shared__ int parent_sh[KM];
+        __shared__ float dp_sh[KM];
+        if (tid == 0) {
+            for (int l = 0; l < K; ++l) { dp_sh[l] = l == 0 ? 0.f : FLT_MAX; parent_sh[l] = -1; }
+            for (int k = 0; k + 1 < K; ++k) {
+                const float orig = dp_sh[k] + sub_len(anchor(k), anchor(k + 1));
+                if (orig < dp_sh[k + 1]) { dp_sh[k + 1] = orig; parent_sh[k + 1] = k; }
+                for (int l = k + 2; l < K; ++l) {
+                    const float c = lens[k * KM + l];
+                    if (c < FLT_MAX && dp_sh[k] + c < dp_sh[l]) { dp_sh[l] = dp_sh[k] + c; parent_sh[l] = k; }
+                }
+            }
+            int c = 0;
+            for (int k = K - 1; k >= 0; k = parent_sh[k]) chain[c++] = k;   // goal first
+            int q = 1;   // waypoint 0 is the start
+            for (int i = c - 1; i > 0; --i) { offs[i] = q; q += piece(chain[i], chain[i - 1]); }
+            tail[0] = q <= max_path ? c : 0;   // does not fit: keep the old path
+            tail[1] = q;
+            tail[2] = 0;
+            for (int d = 0; d < dim; ++d) Q[d] = P[d];
         }
         return;
     }
 
-    // --- phase 3: shortest path over the anchors, path rebuilt into Q ---
-    __shared__ int parent_sh[KM], chain_sh[KM], n_chain_sh, q_len_sh;
-    __shared__ float dp_sh[KM];
-    if (tid == 0) {
-        for (int l = 0; l < K; ++l) { dp_sh[l] = l == 0 ? 0.f : FLT_MAX; parent_sh[l] = -1; }
-        for (int k = 0; k + 1 < K; ++k) {
-            const float orig = dp_sh[k] + sub_len(anchor(k), anchor(k + 1));
-            if (orig < dp_sh[k + 1]) { dp_sh[k + 1] = orig; parent_sh[k + 1] = k; }
-            for (int l = k + 2; l < K; ++l) {
-                const float c = lens[k * KM + l];
-                if (c < FLT_MAX && dp_sh[k] + c < dp_sh[l]) { dp_sh[l] = dp_sh[k] + c; parent_sh[l] = k; }
+    if (phase == 5) {   // --- the pieces, in parallel over the problem's blocks ---
+        const int nc = tail[0];
+        for (int i = nc - 1 - sub; i > 0; i -= nb) {
+            const int k = chain[i], l = chain[i - 1], ia = anchor(k), ib = anchor(l), m = piece(k, l);
+            const float* src = P + (ia + 1) * dim;   // the original sub-path
+            if (l > k + 1) {
+                src = P + ib * dim;
+                if (constrained) {   // the projected segment again (same seed and bound)
+                    const bool ok = connect_seg(P + ia * dim, src, true, k * KM + l, sub_len(ia, ib));
+                    if (tid == 0 && (!ok || nseg_sh != m)) tail[2] = 1;   // not reproduced
+                    src = S;
+                }
             }
+            for (int x = tid; x < m * dim; x += blockDim.x) Q[offs[i] * dim + x] = src[x];
+            __syncthreads();
         }
-        int c = 0;
-        for (int k = K - 1; k >= 0; k = parent_sh[k]) chain_sh[c++] = k;
-        n_chain_sh = c;
-        q_len_sh = 1;
-        for (int d = 0; d < dim; ++d) Q[d] = P[d];
+        return;
     }
-    __syncthreads();
-    for (int c = n_chain_sh - 1; c > 0; --c) {
-        const int k = chain_sh[c], l = chain_sh[c - 1];
-        const int ia = anchor(k), ib = anchor(l);
-        bool shortcut = l > k + 1;
-        if (shortcut && constrained)   // the projected segment again (same seed)
-            shortcut = connect_seg(P + ia * dim, P + ib * dim, true, k * KM + l);
-        if (tid == 0) {
-            // straight shortcut: just its end; constrained: its segment; else the sub-path
-            const float* src = shortcut ? (constrained ? S : P + ib * dim) : P + (ia + 1) * dim;
-            const int m = shortcut ? (constrained ? nseg_sh : 1) : ib - ia;
-            if (q_len_sh + m <= max_path) {
-                for (int x = 0; x < m * dim; ++x) Q[q_len_sh * dim + x] = src[x];
-                q_len_sh += m;
-            } else {
-                q_len_sh = -1;   // does not fit: keep the old path
-            }
-        }
-        __syncthreads();
-        if (q_len_sh < 0) break;
-    }
-    if (q_len_sh > 0) {
-        for (int x = tid; x < q_len_sh * dim; x += blockDim.x) P[x] = Q[x];
-        if (tid == 0) path_len[p] = q_len_sh;
+
+    // --- phase 6: the rebuilt path replaces the old one ---
+    if (tail[0] > 0 && !tail[2]) {
+        for (int x = tid; x < tail[1] * dim; x += blockDim.x) P[x] = Q[x];
+        if (tid == 0) path_len[p] = tail[1];
     }
 }
 
@@ -1828,6 +1857,7 @@ struct PlannerPool {
     int* queue = nullptr;                     // shortcut-graph (phase 2) work counter
     float* seg = nullptr;    size_t seg_cap = 0;   // shortcut segments [batch, seg_max, dim]
     int grid_cap = 0;                         // resident blocks of the planner kernel (whole GPU)
+    int sc_cap = 0;                           // ... and of the shortcut kernel
     cudaError_t reserve(int batch, size_t n_radii, int threads) {
         if (n_radii > radii_cap) {
             radii = static_cast<float*>(prrax_scratch(sizeof(float) * n_radii));
@@ -1841,7 +1871,7 @@ struct PlannerPool {
             batch_cap = batch;
         }
         // occupancy depends only on the device and block size: cached per thread
-        static thread_local int cap_dev = -1, cap_threads = -1, cap = 0;
+        static thread_local int cap_dev = -1, cap_threads = -1, cap = 0, cap_sc = 0;
         int dev = 0;
         cudaGetDevice(&dev);
         if (dev != cap_dev || threads != cap_threads) {
@@ -1849,8 +1879,11 @@ struct PlannerPool {
             cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
             cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, prrax_plan_batch_kernel, threads, 0);
             cap = std::max(1, sms * per_sm); cap_dev = dev; cap_threads = threads;
+            cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, prrax_shortcut_batch_kernel, threads, 0);
+            cap_sc = std::max(1, sms * per_sm);
         }
         grid_cap = cap;
+        sc_cap = cap_sc;
         return cudaSuccess;
     }
     cudaError_t reserve_seg(size_t n) {
@@ -1954,10 +1987,10 @@ static cudaError_t prrax_plan_raw(cudaStream_t stream, const float* inputs, cons
     if (S.shortcut_rounds > 0) {
         const int seg_max = 16 * granularity;   // up to 16 steps of granularity waypoints
         // Blocks per problem: enough to fill the GPU (the shortcut graph has up to K^2/2 pairs).
-        const int nb = std::max(1, g_pool.grid_cap / batch);
+        const int nb = std::max(1, g_pool.sc_cap / batch);
         const int grid = batch * nb;
         e = g_pool.reserve_seg((size_t)grid * seg_max * dim + (size_t)batch * max_path * dim
-                               + (size_t)batch * PRRAX_SC_ANCHORS * PRRAX_SC_ANCHORS);
+                               + (size_t)batch * (PRRAX_SC_ANCHORS * PRRAX_SC_ANCHORS + PRRAX_SC_INTS));
         if (e != cudaSuccess) return e;
         auto launch = [&](int phase, int g) {
             if (phase == 2) cudaMemsetAsync(g_pool.queue, 0, sizeof(int), stream);
@@ -1972,6 +2005,8 @@ static cudaError_t prrax_plan_raw(cudaStream_t stream, const float* inputs, cons
             launch(4, batch);
             launch(2, grid);
             launch(3, batch);
+            launch(5, grid);
+            launch(6, batch);
             for (int step = 0; step < PRRAX_BSPLINE_STEPS; ++step) { launch(0, grid); launch(1, grid); }
         }
     }
@@ -2200,7 +2235,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
 
 // MR. POP simplification of caller-supplied paths (e.g. a path stitched from many planner
 // calls), with exactly the schedule PrrtcPlannerImpl runs on its own traced path: per round,
-// the shortcut graph (phases 4, 2, 3) then PRRAX_BSPLINE_STEPS smoothing sweeps (0, 1).
+// the shortcut graph (phases 4, 2, 3, 5, 6) then PRRAX_BSPLINE_STEPS smoothing sweeps (0, 1).
 __global__ void prrax_fill_int_kernel(int* x, int n, int v) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) x[i] = v;
@@ -2234,10 +2269,10 @@ static cudaError_t prrax_simplify_raw(cudaStream_t stream, const float* inputs, 
     L.batch = batch; L.dim = dim;
     for (int k = 0; k < 4; ++k) L.max_w[k] = mw[k];
     const int seg_max = 16 * granularity;
-    const int nb = std::max(1, g_pool.grid_cap / batch);
+    const int nb = std::max(1, g_pool.sc_cap / batch);
     const int grid = batch * nb;
     e = g_pool.reserve_seg((size_t)grid * seg_max * dim + (size_t)batch * max_path * dim
-                           + (size_t)batch * PRRAX_SC_ANCHORS * PRRAX_SC_ANCHORS);
+                           + (size_t)batch * (PRRAX_SC_ANCHORS * PRRAX_SC_ANCHORS + PRRAX_SC_INTS));
     if (e != cudaSuccess) return e;
     auto launch = [&](int phase, int g) {
         if (phase == 2) cudaMemsetAsync(g_pool.queue, 0, sizeof(int), stream);
@@ -2249,6 +2284,8 @@ static cudaError_t prrax_simplify_raw(cudaStream_t stream, const float* inputs, 
         launch(4, batch);
         launch(2, grid);
         launch(3, batch);
+        launch(5, grid);
+        launch(6, batch);
         for (int step = 0; step < PRRAX_BSPLINE_STEPS; ++step) { launch(0, grid); launch(1, grid); }
     }
     return cudaGetLastError();
