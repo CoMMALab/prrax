@@ -125,8 +125,8 @@ def visualize_tree_with_viser(robot, urdf, result, obstacles=None, hz: float = 1
         ee_path = fk_path[:, ee_idx, 4:7]
         server.scene.add_spline_catmull_rom("/solution_path", positions=ee_path, color=(0, 220, 60), line_width=3.0)
 
-    # URDF slider over all nodes (path first if solved, then tree nodes)
-    all_configs = configs_a if not (result.solved and result.path is not None) else np.concatenate([np.array(result.path, dtype=np.float32), configs_a], axis=0)
+    # URDF slider over the solved path (trees are shown as point clouds); start tree if unsolved
+    all_configs = np.array(result.path, dtype=np.float32) if (result.solved and result.path is not None) else configs_a
     urdf_vis = ViserUrdf(server, urdf, root_node_name="/robot")
     slider = server.gui.add_slider("Node", min=0, max=len(all_configs) - 1, step=1, initial_value=0)
 
