@@ -187,8 +187,10 @@ struct CollisionContext {
     int n_world_halfspaces;
     int enabled;
     // Collision-checker selection:
-    //   0 = binary       — pRRTC-style early-exit boolean check. Returns at the first
-    //                       penetrating obstacle; minimal work per config.
+    //   0 = binary       — pRRTC-style early-exit boolean check on crocket's traced FK
+    //                       (prrtc_fused_in_collision). Returns at the first penetrating
+    //                       obstacle; minimal work per config. Modes 2/3 fall back to it
+    //                       when the robot has no coarse model.
     //   1 = differentiable — sweeps every (robot sphere, obstacle) pair with no early exit
     //                       and accumulates colldist_from_sdf(d, margin); in collision when
     //                       the aggregate cost is negative (any sphere within the margin).
@@ -222,86 +224,6 @@ __device__ __forceinline__ bool check_aborted(const CollisionContext& ctx, int i
 #ifndef PRRTC_CC_MAX_JOINTS
 #define PRRTC_CC_MAX_JOINTS 16
 #endif
-
-// Binary (early-exit) collision check — the original pRRTC SIMT semantics.
-// FK transforms for the configuration are precomputed in T_world.
-__device__ __forceinline__ bool prrtc_config_in_collision_binary(
-    const CollisionContext& ctx,
-    const float* __restrict__ T_world,
-    int first, int stride
-) {
-    // Robot-vs-world collision check against all primitive types.
-    for (int rs = first; rs < prrax::n_spheres; rs += stride) {
-        if (check_aborted(ctx, rs)) return true;
-        const int link_idx = prrax::kSphereJoint[rs];
-        if (link_idx >= grim::robot::n_frames) continue;
-
-        const float* T = frame_tf(T_world, link_idx);
-        const float* local = &prrax::kSphereLocal[rs * 3];
-        float world_pt[3];
-        apply_se3_point(T, local, world_pt);
-        const float rr = prrax::kSphereRadius[rs];
-        const float sx = world_pt[0], sy = world_pt[1], sz = world_pt[2];
-
-        for (int ws = 0; ws < ctx.n_world_spheres; ++ws) {
-            const float* obs = &ctx.world_spheres[ws * 4];
-            if (sphere_sphere_dist(sx, sy, sz, rr,
-                                   obs[0], obs[1], obs[2], obs[3]) <= 0.0f)
-                return true;
-        }
-
-        for (int wc = 0; wc < ctx.n_world_capsules; ++wc) {
-            const float* cap = &ctx.world_capsules[wc * 7];
-            if (sphere_capsule_dist(sx, sy, sz, rr,
-                                    cap[0], cap[1], cap[2],
-                                    cap[3], cap[4], cap[5], cap[6]) <= 0.0f)
-                return true;
-        }
-
-        for (int wb = 0; wb < ctx.n_world_boxes; ++wb) {
-            const float* box = &ctx.world_boxes[wb * 15];
-            if (sphere_box_dist(sx, sy, sz, rr,
-                                box[0], box[1], box[2],
-                                box[3], box[4], box[5],
-                                box[6], box[7], box[8],
-                                box[9], box[10], box[11],
-                                box[12], box[13], box[14]) <= 0.0f)
-                return true;
-        }
-
-        for (int wh = 0; wh < ctx.n_world_halfspaces; ++wh) {
-            const float* hs = &ctx.world_halfspaces[wh * 6];
-            if (sphere_halfspace_dist(sx, sy, sz, rr,
-                                      hs[0], hs[1], hs[2],
-                                      hs[3], hs[4], hs[5]) <= 0.0f)
-                return true;
-        }
-    }
-
-    // Optional self-collision checks over active sphere-pair list.
-    for (int p = first; p < prrax::n_self_pairs; p += stride) {
-        if (check_aborted(ctx, p)) return true;
-        const int i = prrax::kSelfPairs[p * 2 + 0];
-        const int j = prrax::kSelfPairs[p * 2 + 1];
-        if (i < 0 || j < 0 || i >= prrax::n_spheres || j >= prrax::n_spheres) continue;
-
-        const int link_i = prrax::kSphereJoint[i];
-        const int link_j = prrax::kSphereJoint[j];
-        if (link_i >= grim::robot::n_frames || link_j >= grim::robot::n_frames) continue;
-
-        float pi[3];
-        float pj[3];
-        apply_se3_point(frame_tf(T_world, link_i), &prrax::kSphereLocal[i * 3], pi);
-        apply_se3_point(frame_tf(T_world, link_j), &prrax::kSphereLocal[j * 3], pj);
-        if (sphere_sphere_dist(
-                pi[0], pi[1], pi[2], prrax::kSphereRadius[i],
-                pj[0], pj[1], pj[2], prrax::kSphereRadius[j]) <= 0.0f) {
-            return true;
-        }
-    }
-
-    return false;
-}
 
 // Differentiable (signed-distance-field) collision check. No early exit: every
 // (robot sphere, obstacle) and self pair contributes a smooth margin penalty via
@@ -500,6 +422,34 @@ __device__ __forceinline__ bool prrtc_config_in_collision_binary_coarse(
 // part p of PRRAX_WP_LANES (or -1: all of it): the lanes of one waypoint split its check,
 // each taking every PRRAX_WP_LANES-th coarse group (with its fine spheres) and coarse self
 // pair. The differentiable checker runs whole on part 0.
+
+// Binary (early-exit) check, pRRTC's semantics: crocket's traced FK of the sphere-carrying
+// frames as [t, R] (prrax_gen.cuh: no quaternion round trip, no sphere-free frames), each
+// centre from a table and tested at once against the per-call obstacles. Loops, not unrolled:
+// the planner kernel is i-cache bound (unrolled, it ran 2.5x slower).
+__device__ __forceinline__ bool prrtc_fused_in_collision(const float* cfg, const CollisionContext& ctx,
+                                                         int first, int stride) {
+    float X[12 * (prrax::n_fused_frames + 1)];
+    prrax::fused_frames(cfg, X);
+    for (int rs = first; rs < prrax::n_spheres; rs += stride) {
+        if (check_aborted(ctx, rs)) return true;
+        float p[3];
+        prrax::fused_centre(X, rs, p);
+        if (prrtc_sphere_vs_world(ctx, p[0], p[1], p[2], prrax::kSphereRadius[rs])) return true;
+    }
+    for (int k = first; k < prrax::n_self_pairs; k += stride) {
+        if (check_aborted(ctx, k)) return true;
+        const int i = prrax::kSelfPairs[2 * k], j = prrax::kSelfPairs[2 * k + 1];
+        if (i < 0 || j < 0 || i >= prrax::n_spheres || j >= prrax::n_spheres) continue;
+        float a[3], b[3];
+        prrax::fused_centre(X, i, a);
+        prrax::fused_centre(X, j, b);
+        if (sphere_sphere_dist(a[0], a[1], a[2], prrax::kSphereRadius[i],
+                               b[0], b[1], b[2], prrax::kSphereRadius[j]) <= 0.0f) return true;
+    }
+    return false;
+}
+
 __device__ __forceinline__ bool prrtc_config_in_collision(
     const float* cfg,
     const CollisionContext& ctx,
@@ -508,17 +458,13 @@ __device__ __forceinline__ bool prrtc_config_in_collision(
 ) {
     const int first = part < 0 ? 0 : part, stride = part < 0 ? 1 : lanes;
     if (!ctx.enabled) return false;
-    
+    const bool coarse = ctx.collision_mode == 2 && prrax::coarse_enabled && prrax::n_coarse <= PRRTC_MAX_LINKS;
+    if (ctx.collision_mode != 1 && !coarse) return prrtc_fused_in_collision(cfg, ctx, first, stride);
+
     float T_world[grim::robot::n_frames * 7];
     grim::robot::frame_poses(cfg, nullptr, T_world);
-
-    if (ctx.collision_mode == 1) {
-        return part <= 0 && prrtc_config_in_collision_differentiable(ctx, T_world);
-    }
-    if (ctx.collision_mode == 2 && prrax::coarse_enabled && prrax::n_coarse <= PRRTC_MAX_LINKS) {
-        return prrtc_config_in_collision_binary_coarse(ctx, T_world, first, stride);
-    }
-    return prrtc_config_in_collision_binary(ctx, T_world, first, stride);
+    if (coarse) return prrtc_config_in_collision_binary_coarse(ctx, T_world, first, stride);
+    return part <= 0 && prrtc_config_in_collision_differentiable(ctx, T_world);
 }
 
 

@@ -3,8 +3,9 @@
 The planner (``CUDA/prrtc_planner.cu``) is compiled once per robot collision model. GRiM's
 ``robot_header`` supplies the kinematics (cricket2's straight-line FK when ``traced``, its baked
 ``__constant__`` tables otherwise); ``prrax_gen.cuh`` bakes prrax's sphere model (fine spheres
-grouped by FK frame, coarse bounding spheres, self pairs) with compile-time counts. World
-obstacles stay per-call inputs.
+grouped by FK frame, coarse bounding spheres, self pairs) with compile-time counts, plus
+crocket's traced FK of the sphere frames for the binary check. World obstacles stay per-call
+inputs: any world runs without a rebuild.
 
 GRiM's ``compile_kernel`` caches on its own kernel sources only, so the prrax sources go into
 the build flags (``-DPRRAX_SRC=<sha1>``): editing them forces a rebuild.
@@ -16,6 +17,7 @@ robot_header); pin the GRiM commit (see README) and revisit if GRiM grows a publ
 from __future__ import annotations
 
 import hashlib
+import tempfile
 from pathlib import Path
 
 import jax
@@ -65,7 +67,56 @@ def prrax_header(ctx) -> str:
             + _table(space, "int", "kFineOffsets", t["fine_link_offsets"])
             + _table(space, "int", "kCoarseSelfPairs", t["coarse_self_pairs"])
             + _table(space, "int", "kSelfPairRanges", t["self_pair_ranges"])
-            + "}  // namespace prrax\n")
+            + "}  // namespace prrax\n" + _traced_spheres(ctx, t, space))
+
+
+def _traced_spheres(ctx, t, space: str) -> str:
+    """The binary check's FK (``prrax::fused_frames`` / ``fused_centre``): crocket's traced pose
+    of each sphere-carrying frame, 12 floats ([t, R column-major]), plus an identity slot for
+    base spheres (link -1); a sphere's centre is its frame slot's ``t + R c`` from a table.
+
+    The sphere / pair walks stay loops over tables: fully unrolled, the per-check instruction
+    footprint thrashed the planner kernel's i-cache (68k -> 110k SASS, 2.5x slower), although a
+    standalone check got faster."""
+    from pyroffi import _grim
+    _grim.ensure_importable()
+    import crocket
+    from grim.motion import _build
+    mr = _grim.motion_robot(ctx["robot"])
+    link, local = t["sphere_link_idx"].reshape(-1).astype(int), t["sphere_local"].reshape(-1, 3)
+    if (link >= mr.n_joints).any():
+        raise ValueError(f"sphere frames {sorted(set(link[link >= mr.n_joints]))} are not joints of "
+                         f"the robot ({mr.n_joints} joints)")
+    frames = sorted({int(j) for j in link if j >= 0})
+    nf = len(frames)
+    src, gather = "", ""
+    if frames:
+        with tempfile.TemporaryDirectory() as tmp:
+            urdf = Path(tmp) / "robot.urdf"
+            urdf.write_text(_build.kinematic_urdf(mr.urdf_xml))
+            model = crocket.Robot(urdf, name="prrax_spheres")
+        src = crocket.generate(model, {"frame_poses": {"frames": tuple(mr.joint_names[j] for j in frames)}},
+                               variants=[crocket.Variant("thread")], name="prrax_spheres") + "\n"
+        # crocket's joint order -> the planner's configuration order (the robot's actuated joints)
+        gather = ("    float q[crocket::robots::prrax_spheres::n_q];\n"
+                  + "".join(f"    q[{i}] = cfg[{mr.actuated_names.index(n)}];\n"
+                            for i, n in enumerate(model.joint_names))
+                  + "    crocket::robots::prrax_spheres::frame_poses_thread<float>(q, X);\n")
+    slot = {j: s for s, j in enumerate(frames)}
+    table = np.concatenate([np.array([slot.get(int(j), nf) for j in link], np.float32).reshape(-1, 1),
+                            local.astype(np.float32),
+                            np.asarray(t["sphere_radius"], np.float32).reshape(-1, 1)], 1)  # slot, c, r
+    return (src + "namespace prrax {\n"
+            f"constexpr int n_fused_frames = {nf};\n"
+            + _table(space, "float", "kFusedSphere", table) +
+            "__device__ __forceinline__ void fused_frames(const float* cfg, float* X) {\n"
+            + gather +
+            "    for (int i = 0; i < 12; ++i) X[12 * n_fused_frames + i] = (i == 3 || i == 7 || i == 11) ? 1.f : 0.f;\n"
+            "}\n"
+            "__device__ __forceinline__ void fused_centre(const float* X, int s, float* p) {\n"
+            "    const float* e = &kFusedSphere[5 * s];\n    const float* T = X + 12 * (int)e[0];\n"
+            "    for (int i = 0; i < 3; ++i) p[i] = T[i] + T[3 + i] * e[1] + T[6 + i] * e[2] + T[9 + i] * e[3];\n"
+            "}\n}  // namespace prrax\n")
 
 
 def _sources_hash() -> str:
