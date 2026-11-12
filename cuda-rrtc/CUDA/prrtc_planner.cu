@@ -2248,7 +2248,7 @@ __global__ void prrax_fill_int_kernel(int* x, int n, int v) {
 static cudaError_t prrax_simplify_raw(cudaStream_t stream, const float* inputs, float* path, int* path_len,
                                       int max_path, int rounds, float step_size, int granularity,
                                       int collision_mode, float collision_margin, int batch, int dim,
-                                      const int mw[4]) {
+                                      const int mw[4], int parts = 3) {   // parts: 1 shortcut, 2 smooth
     const float* in = inputs;
     const float* min_in = in;            in += dim;
     const float* max_in = in;            in += dim;
@@ -2281,12 +2281,15 @@ static cudaError_t prrax_simplify_raw(cudaStream_t stream, const float* inputs, 
             max_path, g_pool.seg, seg_max, grid, phase == 2 ? g_pool.queue : nullptr);
     };
     for (int r = 0; r < rounds; ++r) {
-        launch(4, batch);
-        launch(2, grid);
-        launch(3, batch);
-        launch(5, grid);
-        launch(6, batch);
-        for (int step = 0; step < PRRAX_BSPLINE_STEPS; ++step) { launch(0, grid); launch(1, grid); }
+        if (parts & 1) {
+            launch(4, batch);
+            launch(2, grid);
+            launch(3, batch);
+            launch(5, grid);
+            launch(6, batch);
+        }
+        if (parts & 2)
+            for (int step = 0; step < PRRAX_BSPLINE_STEPS; ++step) { launch(0, grid); launch(1, grid); }
     }
     return cudaGetLastError();
 }
@@ -2300,7 +2303,7 @@ static ffi::Error PrraxSimplifyImpl(
     ffi::Result<ffi::Buffer<ffi::DataType::F32>> path,
     ffi::Result<ffi::Buffer<ffi::DataType::S32>> path_len,
     int rounds, float step_size, int granularity, int collision_mode, float collision_margin,
-    int batch, int dim, int mw0, int mw1, int mw2, int mw3)
+    int batch, int dim, int mw0, int mw1, int mw2, int mw3, int parts)
 {
     const int max_path = static_cast<int>(path->dimensions()[1]);
     cudaMemcpyAsync(path->typed_data(), path_in.typed_data(), sizeof(float) * (size_t)batch * max_path * dim,
@@ -2310,7 +2313,7 @@ static ffi::Error PrraxSimplifyImpl(
     PrraxScratchScope scope(scratch);
     const cudaError_t e = prrax_simplify_raw(stream, inputs.typed_data(), path->typed_data(), path_len->typed_data(),
                                              max_path, rounds, step_size, granularity, collision_mode,
-                                             collision_margin, batch, dim, mw);
+                                             collision_margin, batch, dim, mw, parts);
     return e == cudaSuccess ? ffi::Error::Success() : ffi::Error(ffi::ErrorCode::kInternal, cudaGetErrorString(e));
 }
 
@@ -2335,4 +2338,5 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Attr<int>("mw1")
         .Attr<int>("mw2")
         .Attr<int>("mw3")
+        .Attr<int>("parts")                      // 1 shortcut graph, 2 B-spline smoothing, 3 both
 );

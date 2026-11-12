@@ -576,16 +576,18 @@ def _take_wps(n: int, w1: int, dim: int):
 def simplify_paths(paths, collision_context, constraints: Sequence = (), *, rounds: int = 1,
                    projection: ProjectionSettings = ProjectionSettings(), min_vals=None, max_vals=None,
                    step_size: float = 0.5, granularity: int = 16, collision_checker: str = "binary",
-                   collision_margin: float = 0.02, max_path_points: Optional[int] = None):
+                   collision_margin: float = 0.02, max_path_points: Optional[int] = None,
+                   shortcut: bool = True, smooth: bool = True):
     """MR. POP simplification (the ``shortcut_rounds`` pass) of caller-supplied paths.
 
     ``paths``: list of ``(n_i, dim)`` arrays (None passed through), all in one world.
     ``constraints``: one constraint list shared by every path. Each change is validated by the
-    planner's own connect, exactly as on a planner path. Returns the simplified list.
+    planner's own connect, exactly as on a planner path. ``shortcut`` / ``smooth`` select a
+    round's parts: the shortcut graph and the B-spline smoothing sweeps. Returns the simplified list.
     """
     live = [i for i, p in enumerate(paths) if p is not None and len(p) > 2]
     out = [None if p is None else np.asarray(p, np.float32) for p in paths]
-    if not live or rounds <= 0:
+    if not live or rounds <= 0 or not (shortcut or smooth):
         return out
     cons = list(constraints)
     ee = tuple(sorted({c.ee_joint for c in cons}))
@@ -611,7 +613,8 @@ def simplify_paths(paths, collision_context, constraints: Sequence = (), *, roun
                               collision_margin=np.float32(collision_margin), batch=np.int32(batch),
                               dim=np.int32(dim), mw0=np.int32(worlds[0].shape[1]),
                               mw1=np.int32(worlds[1].shape[1]), mw2=np.int32(worlds[2].shape[1]),
-                              mw3=np.int32(worlds[3].shape[1])))
+                              mw3=np.int32(worlds[3].shape[1]),
+                              parts=np.int32(int(shortcut) | 2 * int(smooth))))
     for b, i in enumerate(live):
         out[i] = np.asarray(Pn[b, :int(ln[b])])
     return out
