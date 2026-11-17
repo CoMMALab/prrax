@@ -2,9 +2,9 @@
 
     python benchmark/trace_robot.py robot.urdf [--srdf robot.srdf] [--boxes 8] [--batch 262144]
 
-The planner traces the robot through crocket and builds on first use anyway (cached per robot
+The planner traces the robot through mantis and builds on first use anyway (cached per robot
 and sphere model); this prebuilds it and checks it. Random configurations are checked against
-random boxes by the binary check (mode 0: crocket's traced FK) and by the differentiable check
+random boxes by the binary check (mode 0: mantis's traced FK) and by the differentiable check
 at margin 0 (mode 1: GRiM's FK and the sphere tables), an independent path in the same build.
 The boxes are per-call inputs, never compiled in: any world runs without a rebuild. Exits
 non-zero if the two disagree.

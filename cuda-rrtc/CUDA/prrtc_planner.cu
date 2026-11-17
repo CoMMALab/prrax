@@ -187,7 +187,7 @@ struct CollisionContext {
     int n_world_halfspaces;
     int enabled;
     // Collision-checker selection:
-    //   0 = binary       — pRRTC-style early-exit boolean check on crocket's traced FK
+    //   0 = binary       — pRRTC-style early-exit boolean check on mantis's traced FK
     //                       (prrtc_fused_in_collision). Returns at the first penetrating
     //                       obstacle; minimal work per config. Modes 2/3 fall back to it
     //                       when the robot has no coarse model.
@@ -423,7 +423,7 @@ __device__ __forceinline__ bool prrtc_config_in_collision_binary_coarse(
 // each taking every PRRAX_WP_LANES-th coarse group (with its fine spheres) and coarse self
 // pair. The differentiable checker runs whole on part 0.
 
-// Binary (early-exit) check, pRRTC's semantics: crocket's traced FK of the sphere-carrying
+// Binary (early-exit) check, pRRTC's semantics: mantis's traced FK of the sphere-carrying
 // frames as [t, R] (prrax_gen.cuh: no quaternion round trip, no sphere-free frames), each
 // centre from a table and tested at once against the per-call obstacles. Loops, not unrolled:
 // the planner kernel is i-cache bound (unrolled, it ran 2.5x slower).

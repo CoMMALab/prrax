@@ -4,7 +4,7 @@ The planner (``CUDA/prrtc_planner.cu``) is compiled once per robot collision mod
 ``robot_header`` supplies the kinematics (cricket2's straight-line FK when ``traced``, its baked
 ``__constant__`` tables otherwise); ``prrax_gen.cuh`` bakes prrax's sphere model (fine spheres
 grouped by FK frame, coarse bounding spheres, self pairs) with compile-time counts, plus
-crocket's traced FK of the sphere frames for the binary check. World obstacles stay per-call
+mantis's traced FK of the sphere frames for the binary check. World obstacles stay per-call
 inputs: any world runs without a rebuild.
 
 GRiM's ``compile_kernel`` caches on its own kernel sources only, so the prrax sources go into
@@ -71,7 +71,7 @@ def prrax_header(ctx) -> str:
 
 
 def _traced_spheres(ctx, t, space: str) -> str:
-    """The binary check's FK (``prrax::fused_frames`` / ``fused_centre``): crocket's traced pose
+    """The binary check's FK (``prrax::fused_frames`` / ``fused_centre``): mantis's traced pose
     of each sphere-carrying frame, 12 floats ([t, R column-major]), plus an identity slot for
     base spheres (link -1); a sphere's centre is its frame slot's ``t + R c`` from a table.
 
@@ -80,7 +80,7 @@ def _traced_spheres(ctx, t, space: str) -> str:
     standalone check got faster."""
     from pyroffi import _grim
     _grim.ensure_importable()
-    import crocket
+    import mantis
     from grim.motion import _build
     mr = _grim.motion_robot(ctx["robot"])
     link, local = t["sphere_link_idx"].reshape(-1).astype(int), t["sphere_local"].reshape(-1, 3)
@@ -94,14 +94,14 @@ def _traced_spheres(ctx, t, space: str) -> str:
         with tempfile.TemporaryDirectory() as tmp:
             urdf = Path(tmp) / "robot.urdf"
             urdf.write_text(_build.kinematic_urdf(mr.urdf_xml))
-            model = crocket.Robot(urdf, name="prrax_spheres")
-        src = crocket.generate(model, {"frame_poses": {"frames": tuple(mr.joint_names[j] for j in frames)}},
-                               variants=[crocket.Variant("thread")], name="prrax_spheres") + "\n"
-        # crocket's joint order -> the planner's configuration order (the robot's actuated joints)
-        gather = ("    float q[crocket::robots::prrax_spheres::n_q];\n"
+            model = mantis.Robot(urdf, name="prrax_spheres")
+        src = mantis.generate(model, {"frame_poses": {"frames": tuple(mr.joint_names[j] for j in frames)}},
+                               variants=[mantis.Variant("thread")], name="prrax_spheres") + "\n"
+        # mantis's joint order -> the planner's configuration order (the robot's actuated joints)
+        gather = ("    float q[mantis::robots::prrax_spheres::n_q];\n"
                   + "".join(f"    q[{i}] = cfg[{mr.actuated_names.index(n)}];\n"
                             for i, n in enumerate(model.joint_names))
-                  + "    crocket::robots::prrax_spheres::frame_poses_thread<float>(q, X);\n")
+                  + "    mantis::robots::prrax_spheres::frame_poses_thread<float>(q, X);\n")
     slot = {j: s for s, j in enumerate(frames)}
     table = np.concatenate([np.array([slot.get(int(j), nf) for j in link], np.float32).reshape(-1, 1),
                             local.astype(np.float32),
