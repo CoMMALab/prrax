@@ -59,7 +59,16 @@ class PRRTCResult(NamedTuple):
 #   "differentiable"     — full smooth signed-distance-field sweep (no early exit).
 #   "binary_coarse"      — coarse bounding-sphere pre-pass gating the fine check.
 #   "binary_coarse_coop" — the coarse check split over lane-groups of the block.
-_COLLISION_MODES = {"binary": 0, "differentiable": 1, "binary_coarse": 2, "binary_coarse_coop": 3}
+#   "traced_edge"        — the whole waypoint check traced by mantis (no early exit inside a
+#                          waypoint; ``edge_tier`` picks the mantis tier); unconstrained edges of the
+#                          planner only, everything else checks as "binary".
+_COLLISION_MODES = {"binary": 0, "differentiable": 1, "binary_coarse": 2, "binary_coarse_coop": 3,
+                    "traced_edge": 4}
+# Padding of the per-problem worlds up to the batch's largest: obstacles out of reach, harmless to
+# a check that reads every slot (traced_edge) as to one that stops at the problem's count.
+_FAR = 1e4
+_PAD = ([_FAR, _FAR, _FAR, 0.0], [_FAR] * 6 + [0.0],
+        [_FAR, _FAR, _FAR, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0], [0, 0, 1, 0, 0, -_FAR])
 _WORLD = (("world_spheres", 4), ("world_capsules", 7), ("world_boxes", 15), ("world_halfspaces", 6))
 
 
@@ -85,15 +94,16 @@ def _resolve_collision_mode(collision_checker: str) -> int:
 _targets: dict[str, tuple[str, ...]] = {}
 
 
-def _planner_targets(collision_context, ee_joints: tuple[int, ...]) -> tuple[str, ...]:
+def _planner_targets(collision_context, ee_joints: tuple[int, ...], edge=None) -> tuple[str, ...]:
     """The build ``(planner, fk, tsr)`` for a context's robot and sphere model with constraint
-    frames ``ee_joints`` (built on first use)."""
-    h = hashlib.sha1(f"{id(collision_context['robot'])}{ee_joints}".encode())
+    frames ``ee_joints`` (built on first use); ``edge``: the traced_edge kernel's tier and padded
+    world counts (``_grim_build._traced_spheres``)."""
+    h = hashlib.sha1(f"{id(collision_context['robot'])}{ee_joints}{edge}".encode())
     for k in _grim_build.ROBOT_KEYS:
         h.update(np.ascontiguousarray(collision_context[k]).tobytes())
     key = h.hexdigest()
     if key not in _targets:
-        _targets[key] = _grim_build.planner_targets(collision_context, ee_joints)
+        _targets[key] = _grim_build.planner_targets(collision_context, ee_joints, edge=edge)
     return _targets[key]
 
 
@@ -254,11 +264,16 @@ def _pack_worlds(contexts) -> list[np.ndarray]:
         arrays = [np.asarray(c.get(key, np.zeros((0, width))), np.float32).reshape(-1, width)
                   for c in contexts]
         counts[:, w] = [a.shape[0] for a in arrays]
-        packed = np.zeros((len(contexts), max(counts[:, w].max(), 1), width), np.float32)
+        packed = np.tile(np.asarray(_PAD[w], np.float32), (len(contexts), max(counts[:, w].max(), 1), 1))
         for i, a in enumerate(arrays):
             packed[i, : a.shape[0]] = a
         out.append(packed)
     return out + [counts]
+
+
+def _check_warps(warps_per_problem):
+    if warps_per_problem not in (1, 2, 4):
+        raise ValueError(f"warps_per_problem must be 1, 2 or 4, got {warps_per_problem}")
 
 
 def _solve(
@@ -266,7 +281,7 @@ def _solve(
     granularity, max_nodes, balance_mode, tree_ratio, dynamic_domain, dd_alpha, dd_radius,
     dd_min_radius, min_vals, max_vals, jit_trace, collision_checker, collision_margin,
     constraints, projection, return_trees=False, max_path_points=8192, ao_passes=0,
-    cost_bound=None, shortcut_rounds=0,
+    cost_bound=None, shortcut_rounds=0, warps_per_problem=1, edge_tier=("thread", 1),
 ) -> list[PRRTCResult]:
     collision_mode = _resolve_collision_mode(collision_checker)
     if any(c is None for c in contexts):
@@ -274,13 +289,21 @@ def _solve(
                          "utils.build_prrtc_collision_context(robot, robot_coll, obstacles)")
     if step_size <= 0.0:
         raise ValueError("step_size must be > 0")
-    # 4 threads per waypoint (PRRAX_WP_LANES in CUDA/prrtc_constraint.cuh), at most 128 per block.
+    _check_warps(warps_per_problem)
+    # Constrained waypoints per edge, one thread each at least (PRRAX_W_MAX = 32 in CUDA).
     if granularity < 1 or (granularity & (granularity - 1)) != 0 or granularity > 32:
         raise ValueError(f"granularity must be a power of 2 <= 32, got {granularity}")
     if projection.mode not in _PROJ_MODES:
         raise ValueError(f"projection.mode must be one of {sorted(_PROJ_MODES)}")
     ee = tuple(sorted({c.ee_joint for cons in constraints for c in cons}))
-    names = {_planner_targets(c, ee) for c in contexts}
+    worlds = _pack_worlds(contexts)
+    edge = None
+    if collision_mode == 4:
+        tier, P = edge_tier
+        if tier not in ("thread", "warp", "block"):
+            raise ValueError(f"edge_tier: ('thread' | 'warp' | 'block', problems per warp), got {edge_tier}")
+        edge = (tier, int(P), int(warps_per_problem), tuple(int(w.shape[1]) for w in worlds[:4]))
+    names = {_planner_targets(c, ee, edge) for c in contexts}
     if len(names) != 1:
         raise ValueError("every problem in a batch must share one robot and sphere model")
     names = names.pop()
@@ -295,7 +318,6 @@ def _solve(
     max_vals = np.asarray(np.pi * np.ones(dim) if max_vals is None else max_vals, np.float32)
     packed = np.stack([_pack_constraints(list(c), ee, projection) for c in constraints])
     wps = int(max_nodes) * (int(granularity) - 1) * dim if any(constraints) else 1
-    worlds = _pack_worlds(contexts)
     call = _planner_call(
         names[0], batch, dim, int(max_nodes), bool(jit_trace), wps, int(max_path_points),
         max_iterations=int(max_iterations), step_size=float(step_size),
@@ -304,6 +326,7 @@ def _solve(
         dd_alpha=float(dd_alpha), dd_radius=float(dd_radius), dd_min_radius=float(dd_min_radius),
         granularity=int(granularity), collision_mode=collision_mode,
         collision_margin=float(collision_margin), shortcut_rounds=int(shortcut_rounds),
+        warps_per_problem=int(warps_per_problem),
         num_goals=int(goal_configs.shape[1]), mw0=worlds[0].shape[1], mw1=worlds[1].shape[1],
         mw2=worlds[2].shape[1], mw3=worlds[3].shape[1],
     )
@@ -399,13 +422,15 @@ def prrtc_plan(
     max_vals: Optional[Float[Array, "dim"]] = None,
     collision_context: Optional[dict] = None,
     jit_trace: bool = False,
-    collision_checker: str = "binary",
+    collision_checker: str = "binary_coarse",
     collision_margin: float = 0.02,
     constraints: Sequence[TSRConstraint] = (),
     projection: ProjectionSettings = ProjectionSettings(),
     return_trees: bool = False,
     ao_passes: int = 0,
     shortcut_rounds: int = 0,
+    warps_per_problem: int = 2,
+    edge_tier: tuple = ("thread", 1),
 ) -> PRRTCResult:
     """
     Plan a path using the parallel RRTC (pRRTC) algorithm.
@@ -416,7 +441,12 @@ def prrtc_plan(
         max_iterations: Maximum number of planning iterations (per block).
         step_size: Maximum extension step size.
         num_new_samples: Number of blocks, each extending toward one sample per iteration.
-        granularity: Waypoints checked per edge (4 threads each). Power of 2, max 32.
+        granularity: Waypoints per constrained (TSR) edge. Power of 2, max 32. Unconstrained
+            edges are checked at ceil(length * 32) waypoints (32 per rad), 4 threads each.
+        warps_per_problem: Threads per planner block, in warps (32 threads): 1, 2 or 4. Default 2
+            (fastest on the MBM and constrained benchmarks, bench_results/2026-11-17).
+        edge_tier: ``(tier, problems per warp)`` of collision_checker="traced_edge": mantis's
+            "thread" (P ignored), "warp" (P in 1..32) or "block" (k = warps_per_problem warps).
         max_nodes: Maximum nodes per tree.
         balance_mode: Tree balancing mode (0/1/2) matching pRRTC settings.
         tree_ratio: Balance threshold ratio used by mode 1/2.
@@ -464,7 +494,7 @@ def prrtc_plan(
         collision_checker=collision_checker, collision_margin=collision_margin,
         constraints=[list(constraints)], projection=projection, return_trees=return_trees,
         ao_passes=ao_passes,
-        shortcut_rounds=shortcut_rounds,
+        shortcut_rounds=shortcut_rounds, warps_per_problem=warps_per_problem, edge_tier=edge_tier,
     )[0]
 
 
@@ -486,7 +516,7 @@ def prrtc_plan_batch(
     max_vals: Optional[Float[Array, "dim"]] = None,
     collision_context: Optional[dict | list | tuple] = None,
     jit_trace: bool = False,
-    collision_checker: str = "binary",
+    collision_checker: str = "binary_coarse",
     collision_margin: float = 0.02,
     constraints: Sequence = (),
     projection: ProjectionSettings = ProjectionSettings(),
@@ -494,6 +524,8 @@ def prrtc_plan_batch(
     ao_passes: int = 0,
     cost_bound: Optional[float] = None,
     shortcut_rounds: int = 0,
+    warps_per_problem: int = 2,
+    edge_tier: tuple = ("thread", 1),
 ) -> list[PRRTCResult]:
     """
     Plan paths for a batch of independent start/goal pairs in parallel on the GPU.
@@ -533,7 +565,7 @@ def prrtc_plan_batch(
         constraints=constraints, projection=projection, return_trees=return_trees,
         ao_passes=ao_passes,
         cost_bound=cost_bound,
-        shortcut_rounds=shortcut_rounds,
+        shortcut_rounds=shortcut_rounds, warps_per_problem=warps_per_problem, edge_tier=edge_tier,
     )
 
 
@@ -575,16 +607,18 @@ def _take_wps(n: int, w1: int, dim: int):
 
 def simplify_paths(paths, collision_context, constraints: Sequence = (), *, rounds: int = 1,
                    projection: ProjectionSettings = ProjectionSettings(), min_vals=None, max_vals=None,
-                   step_size: float = 0.5, granularity: int = 16, collision_checker: str = "binary",
+                   step_size: float = 0.5, granularity: int = 16, collision_checker: str = "binary_coarse",
                    collision_margin: float = 0.02, max_path_points: Optional[int] = None,
-                   shortcut: bool = True, smooth: bool = True):
+                   shortcut: bool = True, smooth: bool = True, warps_per_problem: int = 2):
     """MR. POP simplification (the ``shortcut_rounds`` pass) of caller-supplied paths.
 
     ``paths``: list of ``(n_i, dim)`` arrays (None passed through), all in one world.
     ``constraints``: one constraint list shared by every path. Each change is validated by the
     planner's own connect, exactly as on a planner path. ``shortcut`` / ``smooth`` select a
-    round's parts: the shortcut graph and the B-spline smoothing sweeps. Returns the simplified list.
+    round's parts: the shortcut graph and the B-spline smoothing sweeps. ``warps_per_problem``:
+    threads per block in warps (1, 2 or 4). Returns the simplified list.
     """
+    _check_warps(warps_per_problem)
     live = [i for i, p in enumerate(paths) if p is not None and len(p) > 2]
     out = [None if p is None else np.asarray(p, np.float32) for p in paths]
     if not live or rounds <= 0 or not (shortcut or smooth):
@@ -614,7 +648,8 @@ def simplify_paths(paths, collision_context, constraints: Sequence = (), *, roun
                               dim=np.int32(dim), mw0=np.int32(worlds[0].shape[1]),
                               mw1=np.int32(worlds[1].shape[1]), mw2=np.int32(worlds[2].shape[1]),
                               mw3=np.int32(worlds[3].shape[1]),
-                              parts=np.int32(int(shortcut) | 2 * int(smooth))))
+                              parts=np.int32(int(shortcut) | 2 * int(smooth)),
+                              warps_per_problem=np.int32(warps_per_problem)))
     for b, i in enumerate(live):
         out[i] = np.asarray(Pn[b, :int(ln[b])])
     return out

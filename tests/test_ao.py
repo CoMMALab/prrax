@@ -32,10 +32,11 @@ def test_ao() -> None:
               collision_checker="binary_coarse")
 
     def collision_free(path, boxes) -> bool:
-        # Edges densified to 0.01 rad: the planner checks 16 waypoints per edge, not just nodes.
+        # Edges densified at the planner's own resolution (ceil(32 * length) waypoints): the
+        # guarantee is a collision-free check at those waypoints, not between them.
         pts = [path[:1]]
         for a, b in zip(path[:-1], path[1:]):
-            n = max(int(np.ceil(np.linalg.norm(b - a) / 0.01)), 1)
+            n = max(int(np.ceil(np.linalg.norm(b - a) * 32)), 1)
             pts.append(a + (b - a) * (np.arange(1, n + 1)[:, None] / n))
         q = jnp.asarray(np.concatenate(pts), jnp.float32)
         d = float(jax.vmap(lambda x: coll.compute_self_collision_distance(robot, x))(q).min())

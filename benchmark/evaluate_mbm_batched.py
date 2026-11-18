@@ -162,6 +162,8 @@ def _batched_solve_group(
         max_vals=hi,
         collision_context=collision_context,
         jit_trace=jit_trace,
+        collision_checker=COLLISION_CHECKER,
+        warps_per_problem=WARPS_PER_PROBLEM,
     )
 
     if warmup:
@@ -341,6 +343,10 @@ def evaluate_robot(
     return results, total_problems, valid_problems, failed_problems
 
 
+COLLISION_CHECKER = "binary_coarse"   # set from --collision-checker in main
+WARPS_PER_PROBLEM = 2          # set from --warps-per-problem in main
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Evaluate pRRTC on MBM datasets (batched per problem)")
     parser.add_argument(
@@ -389,11 +395,18 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--max-problems-per-set", type=int, default=0)
     parser.add_argument("--print-failures", action="store_true")
+    parser.add_argument("--collision-checker", default="binary_coarse",
+                        choices=["binary", "binary_coarse", "binary_coarse_coop"])
+    parser.add_argument("--warps-per-problem", type=int, default=2, choices=[1, 2, 4],
+                        help="threads per planner block, in warps of 32")
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    global COLLISION_CHECKER, WARPS_PER_PROBLEM
+    COLLISION_CHECKER = args.collision_checker
+    WARPS_PER_PROBLEM = args.warps_per_problem
 
     tick = time.perf_counter()
 

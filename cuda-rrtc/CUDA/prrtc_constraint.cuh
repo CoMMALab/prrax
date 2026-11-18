@@ -12,7 +12,7 @@
  * end-effector, the geometric Jacobian of traced frame poses otherwise.
  *
  * Constrained extend from q_from toward q_target, run by all threads of a block, fills the
- * block's W = blockDim.x waypoints (on the manifold, gaps <= gap_factor * dist / W):
+ * edge's W = granularity waypoints (W <= blockDim.x; on the manifold, gaps <= gap_factor * dist / W):
  *   mode 0 (McVAMP): each thread projects q_steer + eps_tid * v (eps ~ N(0, sigma^2), thread 0
  *       unperturbed); the lowest converged thread's result is q_proj. Then waypoint t projects
  *       lerp(q_from, q_proj, (t+1)/W) independently and the gaps are checked.
@@ -31,8 +31,9 @@
 #include "glass.cuh"         // GLASS: thread-tier BLAS / LAPACK / Lie-group ops
 #include "glass_solve.cuh"   // GRiM: tier_posv over GLASS
 
-// Threads per edge waypoint (pRRTC uses 4): blocks run PRRAX_WP_LANES * W threads for W waypoints;
-// the lanes of a waypoint split its collision check and every thread is a stage-1 steer particle.
+// Threads per edge waypoint (pRRTC uses 4) for unconstrained edge checks: the lanes of a waypoint
+// split its collision check. Blocks run 32 * warps_per_problem threads; every thread is a
+// stage-1 steer particle of the constrained extend.
 #ifndef PRRAX_WP_LANES
 #define PRRAX_WP_LANES 4
 #endif
@@ -159,11 +160,20 @@ __device__ float tsr_step(const float* __restrict__ con, const float* __restrict
                           float* __restrict__ q, float* step_len)
 {
     constexpr int dim = R::n_q;
-    float d[6], Jx[6 * dim], g[dim];
+    float g[dim];
     *step_len = 0.f;
+#ifdef PRRAX_TRACED_TSR
+    // prrax's mantis-traced step (jax/_mantis_algorithms.py): FK, Jacobian, hinge and the 6x6
+    // solve in one straight-line kernel; the constraint is read from CON_RTE_INV on.
+    const float e2 = prrax::tsr_step_traced(static_cast<int>(con[CON_EE]), q, con + CON_RTE_INV,
+                                            cp[CONS_LAMBDA], g);
+    if (e2 < cp[CONS_TOL] * cp[CONS_TOL]) return e2;
+#else
+    float d[6], Jx[6 * dim];
     const float e2 = tsr_eval(con, cp, q, d, Jx, true);
     if (e2 < cp[CONS_TOL] * cp[CONS_TOL]) return e2;
     damped_pinv_apply(Jx, d, cp[CONS_LAMBDA], g);
+#endif
     glass::thread::axpy<float, dim>(-cp[CONS_ALPHA], g, q);
     *step_len = cp[CONS_ALPHA] * glass::thread::nrm2<float, dim>(g);
     return e2;
@@ -232,14 +242,14 @@ __device__ __forceinline__ float hash_normal(unsigned bid, unsigned iter, unsign
 
 /**
  * Constrained extend from q_from toward q_target (shared memory, n_q floats each). Every
- * thread of the block must call it. On success the W = blockDim.x waypoints (the last is
+ * thread of the block must call it. On success the W (<= blockDim.x) waypoints (the last is
  * the new end) are in wp_sh [W * CONFIG_DIM_MAX] and true is returned (uniformly).
  */
 __device__ bool constrained_extend(const float* __restrict__ cp, const float* q_from,
                                    const float* q_target, float step,
                                    const float* __restrict__ lo, const float* __restrict__ hi,
                                    float* wp_sh, int* flag_sh, unsigned bid, unsigned call,
-                                   const int* solved)
+                                   const int* solved, int W)
 {
     const volatile int* abort = solved;   // projections stop once the problem is solved
     if (threadIdx.x == 0) *flag_sh = *abort != 0;
@@ -247,7 +257,7 @@ __device__ bool constrained_extend(const float* __restrict__ cp, const float* q_
     if (*flag_sh) return false;   // block-uniform
     constexpr int dim = R::n_q;
     // W waypoints, handled by the first W threads; every thread is a stage-1 particle.
-    const int tid = threadIdx.x, W = blockDim.x / PRRAX_WP_LANES, NP = blockDim.x;
+    const int tid = threadIdx.x, NP = blockDim.x;
     const bool lead = tid < W;
     const float dist_full = sqrtf(sq_dist(q_from, q_target));
     if (dist_full < 1e-8f) return false;

@@ -34,11 +34,30 @@ namespace ffi = xla::ffi;
 #define TREE_MAX_NODES 1000000
 #endif
 
-// Maximum threads per block. Granularity is passed at runtime; shared memory
-// arrays are sized to this maximum. Must be a power of 2.
-// Matches pRRTC's source default (4*granularity = 4*64 = 256 was its max; we cap at 64
-// because collision checks dominate and registers become the bottleneck above that).
+// Threads per block: 32 * warps_per_problem (1, 2 or 4), chosen at launch; shared memory
+// arrays are sized to this maximum.
 #define PRRTC_BLOCK_THREADS_MAX 128
+// Max constrained waypoints per edge (granularity); every one needs a thread (W <= blockDim.x).
+#define PRRAX_W_MAX 32
+
+// Block-wide argmin of (v, i), result in every thread: __shfl_down_sync within each warp, then
+// the per-warp minima through shared memory. Strict <, so ties keep the lower thread's entry.
+// Collective (every thread of the block, full warps).
+__device__ __forceinline__ void prrax_block_argmin(float& v, int& i) {
+    __shared__ float wv[PRRTC_BLOCK_THREADS_MAX / 32];
+    __shared__ int   wi[PRRTC_BLOCK_THREADS_MAX / 32];
+    for (int off = 16; off > 0; off >>= 1) {
+        const float ov = __shfl_down_sync(0xffffffffu, v, off);
+        const int   oi = __shfl_down_sync(0xffffffffu, i, off);
+        if (ov < v) { v = ov; i = oi; }
+    }
+    if ((threadIdx.x & 31) == 0) { wv[threadIdx.x >> 5] = v; wi[threadIdx.x >> 5] = i; }
+    __syncthreads();
+    v = wv[0]; i = wi[0];
+    for (int w = 1; w < static_cast<int>(blockDim.x >> 5); ++w)
+        if (wv[w] < v) { v = wv[w]; i = wi[w]; }
+    __syncthreads();   // wv/wi are reused by the next call
+}
 
 
 __device__ __forceinline__ void prrtc_radius_shrink_atomic(
@@ -218,12 +237,14 @@ __device__ __forceinline__ bool check_aborted(const CollisionContext& ctx, int i
 #ifndef PRRTC_CC_LANES
 #define PRRTC_CC_LANES 4
 #endif
-// Joint cap for the per-group shared FK buffer used by the cooperative path. Sized small
-// (most manipulators ≤ this) to keep shared-memory use modest; falls back to the
-// per-thread coarse check when a robot exceeds it.
-#ifndef PRRTC_CC_MAX_JOINTS
-#define PRRTC_CC_MAX_JOINTS 16
+// Per-group shared FK buffer of the cooperative path: the fused frames ([t, R] per
+// sphere-carrying frame plus the base slot, prrax_gen.cuh). Robots with more fused frames than
+// PRRAX_CC_MAX_FRAMES (baxter: 33) fall back to the per-thread coarse check: 32 groups of 34
+// frames would overflow the 48 KB of static shared memory.
+#ifndef PRRAX_CC_MAX_FRAMES
+#define PRRAX_CC_MAX_FRAMES 15
 #endif
+#define PRRAX_CC_X (12 * ((prrax::n_fused_frames < PRRAX_CC_MAX_FRAMES ? prrax::n_fused_frames : PRRAX_CC_MAX_FRAMES) + 1))
 
 // Differentiable (signed-distance-field) collision check. No early exit: every
 // (robot sphere, obstacle) and self pair contributes a smooth margin penalty via
@@ -344,7 +365,7 @@ __device__ __forceinline__ bool prrtc_sphere_vs_world(
 // flat binary check — just with far less work on the common (free) path.
 __device__ __forceinline__ bool prrtc_config_in_collision_binary_coarse(
     const CollisionContext& ctx,
-    const float* __restrict__ T_world,
+    const float* __restrict__ X,   // prrax::fused_frames
     int first, int stride
 ) {
     const int n_coarse = prrax::n_coarse;
@@ -354,10 +375,8 @@ __device__ __forceinline__ bool prrtc_config_in_collision_binary_coarse(
     // --- Coarse world pre-pass: flag groups that might collide. ---
     bool any_dirty = false;
     for (int k = first; k < n_coarse; k += stride) {
-        const int link_idx = prrax::kCoarseJoint[k];
-        if (link_idx >= grim::robot::n_frames) continue;
         float wp[3];
-        apply_se3_point(frame_tf(T_world, link_idx), &prrax::kCoarseLocal[k * 3], wp);
+        prrax::fused_coarse_centre(X, k, wp);
         if (prrtc_sphere_vs_world(ctx, wp[0], wp[1], wp[2], prrax::kCoarseRadius[k])) {
             link_dirty[k] = true;
             any_dirty = true;
@@ -371,10 +390,8 @@ __device__ __forceinline__ bool prrtc_config_in_collision_binary_coarse(
             const int start = prrax::kFineOffsets[k];
             const int end   = prrax::kFineOffsets[k + 1];
             for (int rs = start; rs < end; ++rs) {
-                const int link_idx = prrax::kSphereJoint[rs];
-                if (link_idx >= grim::robot::n_frames) continue;
                 float wp[3];
-                apply_se3_point(frame_tf(T_world, link_idx), &prrax::kSphereLocal[rs * 3], wp);
+                prrax::fused_centre(X, rs, wp);
                 if (prrtc_sphere_vs_world(ctx, wp[0], wp[1], wp[2], prrax::kSphereRadius[rs]))
                     return true;
             }
@@ -387,13 +404,9 @@ __device__ __forceinline__ bool prrtc_config_in_collision_binary_coarse(
         const int ck_i = prrax::kCoarseSelfPairs[p * 2 + 0];
         const int ck_j = prrax::kCoarseSelfPairs[p * 2 + 1];
         if (ck_i < 0 || ck_j < 0 || ck_i >= n_coarse || ck_j >= n_coarse) continue;
-        const int cli = prrax::kCoarseJoint[ck_i];
-        const int clj = prrax::kCoarseJoint[ck_j];
-        if (cli >= grim::robot::n_frames || clj >= grim::robot::n_frames) continue;
-
         float ci[3], cj[3];
-        apply_se3_point(frame_tf(T_world, cli), &prrax::kCoarseLocal[ck_i * 3], ci);
-        apply_se3_point(frame_tf(T_world, clj), &prrax::kCoarseLocal[ck_j * 3], cj);
+        prrax::fused_coarse_centre(X, ck_i, ci);
+        prrax::fused_coarse_centre(X, ck_j, cj);
         if (sphere_sphere_dist(ci[0], ci[1], ci[2], prrax::kCoarseRadius[ck_i],
                                cj[0], cj[1], cj[2], prrax::kCoarseRadius[ck_j]) > 0.0f)
             continue;  // coarse pair clear ⇒ all its fine pairs clear
@@ -404,12 +417,9 @@ __device__ __forceinline__ bool prrtc_config_in_collision_binary_coarse(
             const int i = prrax::kSelfPairs[q * 2 + 0];
             const int j = prrax::kSelfPairs[q * 2 + 1];
             if (i < 0 || j < 0 || i >= prrax::n_spheres || j >= prrax::n_spheres) continue;
-            const int link_i = prrax::kSphereJoint[i];
-            const int link_j = prrax::kSphereJoint[j];
-            if (link_i >= grim::robot::n_frames || link_j >= grim::robot::n_frames) continue;
             float pi[3], pj[3];
-            apply_se3_point(frame_tf(T_world, link_i), &prrax::kSphereLocal[i * 3], pi);
-            apply_se3_point(frame_tf(T_world, link_j), &prrax::kSphereLocal[j * 3], pj);
+            prrax::fused_centre(X, i, pi);
+            prrax::fused_centre(X, j, pj);
             if (sphere_sphere_dist(pi[0], pi[1], pi[2], prrax::kSphereRadius[i],
                                    pj[0], pj[1], pj[2], prrax::kSphereRadius[j]) <= 0.0f)
                 return true;
@@ -460,10 +470,14 @@ __device__ __forceinline__ bool prrtc_config_in_collision(
     if (!ctx.enabled) return false;
     const bool coarse = ctx.collision_mode == 2 && prrax::coarse_enabled && prrax::n_coarse <= PRRTC_MAX_LINKS;
     if (ctx.collision_mode != 1 && !coarse) return prrtc_fused_in_collision(cfg, ctx, first, stride);
+    if (coarse) {
+        float X[12 * (prrax::n_fused_frames + 1)];
+        prrax::fused_frames(cfg, X);
+        return prrtc_config_in_collision_binary_coarse(ctx, X, first, stride);
+    }
 
     float T_world[grim::robot::n_frames * 7];
     grim::robot::frame_poses(cfg, nullptr, T_world);
-    if (coarse) return prrtc_config_in_collision_binary_coarse(ctx, T_world, first, stride);
     return part <= 0 && prrtc_config_in_collision_differentiable(ctx, T_world);
 }
 
@@ -485,7 +499,7 @@ __device__ __forceinline__ bool prrtc_config_in_collision(
 #define PRRAX_SWEEP_LANES 2
 #endif
 __device__ __forceinline__ bool prrtc_gap_invalid(const float* prev, const float* wp, int dim,
-                                                  const CollisionContext& ctx, int part,
+                                                  const CollisionContext& ctx, int part, int lanes,
                                                   const float* cons, const float* lo, const float* hi) {
     float d2 = 0.f;
     for (int k = 0; k < dim; ++k) { const float e = wp[k] - prev[k]; d2 += e * e; }
@@ -500,10 +514,10 @@ __device__ __forceinline__ bool prrtc_gap_invalid(const float* prev, const float
             if (!prrax_cons::tsr_project(cons, x, lo, hi)) return true;
             if (prrax_cons::sq_dist(x, lin) >= max_drift2) return true;
         }
-        if (prrtc_config_in_collision(x, ctx, part)) return true;
+        if (prrtc_config_in_collision(x, ctx, part, lanes)) return true;
     }
     for (int k = 0; k < dim; ++k) x[k] = wp[k];
-    return prrtc_config_in_collision(x, ctx, part);
+    return prrtc_config_in_collision(x, ctx, part, lanes);
 }
 
 // Cooperative SIMT coarse→fine edge check (Phase B, source-pRRTC style). The block's
@@ -519,7 +533,7 @@ __device__ __forceinline__ void prrtc_edge_cc_cooperative(
     int dim,
     int W,
     const CollisionContext& ctx,
-    float* __restrict__ cc_group_T,   // shared scratch [n_groups * PRRTC_CC_MAX_JOINTS * 7]
+    float* __restrict__ cc_group_T,   // shared scratch [n_groups * PRRAX_CC_X] (fused frames)
     int* __restrict__ any_collision_sh,
     const float* __restrict__ waypoints = nullptr,  // [W * CONFIG_DIM_MAX]; else base + t * delta
     const float* __restrict__ cons = nullptr,       // constrained: gap substeps are projected
@@ -536,7 +550,10 @@ __device__ __forceinline__ void prrtc_edge_cc_cooperative(
         ((1u << PRRTC_CC_LANES) - 1u) << ((lane_in_warp / PRRTC_CC_LANES) * PRRTC_CC_LANES);
     const int group_lane0 = (lane_in_warp / PRRTC_CC_LANES) * PRRTC_CC_LANES;
 
-    float* myT = &cc_group_T[group * PRRTC_CC_MAX_JOINTS * 7];
+    float* myT = &cc_group_T[group * PRRAX_CC_X];
+    // Straight unconstrained edges come with W at the resolution: each waypoint is one item.
+    const bool sweep = waypoints != nullptr || cons != nullptr;
+    const int n_sub = sweep ? PRRAX_GAP_MAX_SUB : 1;
 
     // Group g sweeps the gap from waypoint w-1 (base for w = 0) to waypoint w as
     // prrtc_gap_invalid does (VAMP's resolution): substeps s = 1..n, s = n the waypoint itself.
@@ -547,7 +564,7 @@ __device__ __forceinline__ void prrtc_edge_cc_cooperative(
         if (lane == 0) stop = (atomicAdd(any_collision_sh, 0) != 0) ? 1 : 0;
         stop = __shfl_sync(group_mask, stop, group_lane0);
         if (stop) break;
-        const int w = item / PRRAX_GAP_MAX_SUB, s = item % PRRAX_GAP_MAX_SUB + 1;
+        const int w = item / n_sub, s = item % n_sub + 1;
         if (w >= W) break;
 
         float interp[CONFIG_DIM_MAX], prev[CONFIG_DIM_MAX];
@@ -561,7 +578,7 @@ __device__ __forceinline__ void prrtc_edge_cc_cooperative(
         float d2 = 0.f;
         for (int d = 0; d < dim; ++d) { const float e = interp[d] - prev[d]; d2 += e * e; }
         const float gap = sqrtf(d2);
-        const int n = min(PRRAX_GAP_MAX_SUB, max(1, static_cast<int>(ceilf(gap * PRRAX_RESOLUTION))));
+        const int n = sweep ? min(PRRAX_GAP_MAX_SUB, max(1, static_cast<int>(ceilf(gap * PRRAX_RESOLUTION)))) : 1;
         if (s > n) continue;   // group-uniform: past this gap's substeps
         int bad = 0;
         if (lane == 0) {
@@ -572,7 +589,7 @@ __device__ __forceinline__ void prrtc_edge_cc_cooperative(
                 if (cons) bad = !prrax_cons::tsr_project(cons, interp, lo, hi)
                               || prrax_cons::sq_dist(interp, lin) >= 4.f * (gap / n) * (gap / n);
             }
-            if (!bad) grim::robot::frame_poses(interp, nullptr, myT);
+            if (!bad) prrax::fused_frames(interp, myT);
         }
         bad = __shfl_sync(group_mask, bad, group_lane0);
         if (bad) { if (lane == 0) atomicOr(any_collision_sh, 1); continue; }
@@ -581,10 +598,8 @@ __device__ __forceinline__ void prrtc_edge_cc_cooperative(
         // Coarse pre-pass: lanes split coarse spheres, build a per-group dirty bitmask.
         unsigned long long dirty = 0ull;
         for (int k = lane; k < prrax::n_coarse; k += PRRTC_CC_LANES) {
-            const int li = prrax::kCoarseJoint[k];
-            if (li >= grim::robot::n_frames) continue;
             float wp[3];
-            apply_se3_point(frame_tf(myT, li), &prrax::kCoarseLocal[k * 3], wp);
+            prrax::fused_coarse_centre(myT, k, wp);
             if (prrtc_sphere_vs_world(ctx, wp[0], wp[1], wp[2], prrax::kCoarseRadius[k]))
                 dirty |= (1ull << k);
         }
@@ -598,10 +613,8 @@ __device__ __forceinline__ void prrtc_edge_cc_cooperative(
             const int s = prrax::kFineOffsets[k];
             const int e = prrax::kFineOffsets[k + 1];
             for (int rs = s + lane; rs < e; rs += PRRTC_CC_LANES) {
-                const int li = prrax::kSphereJoint[rs];
-                if (li >= grim::robot::n_frames) continue;
                 float wp[3];
-                apply_se3_point(frame_tf(myT, li), &prrax::kSphereLocal[rs * 3], wp);
+                prrax::fused_centre(myT, rs, wp);
                 if (prrtc_sphere_vs_world(ctx, wp[0], wp[1], wp[2], prrax::kSphereRadius[rs])) {
                     hit = true;
                     break;
@@ -617,12 +630,9 @@ __device__ __forceinline__ void prrtc_edge_cc_cooperative(
                 const int ci = prrax::kCoarseSelfPairs[p * 2 + 0];
                 const int cj = prrax::kCoarseSelfPairs[p * 2 + 1];
                 if (ci < 0 || cj < 0 || ci >= prrax::n_coarse || cj >= prrax::n_coarse) continue;
-                const int li = prrax::kCoarseJoint[ci];
-                const int lj = prrax::kCoarseJoint[cj];
-                if (li >= grim::robot::n_frames || lj >= grim::robot::n_frames) continue;
                 float a[3], b[3];
-                apply_se3_point(frame_tf(myT, li), &prrax::kCoarseLocal[ci * 3], a);
-                apply_se3_point(frame_tf(myT, lj), &prrax::kCoarseLocal[cj * 3], b);
+                prrax::fused_coarse_centre(myT, ci, a);
+                prrax::fused_coarse_centre(myT, cj, b);
                 if (sphere_sphere_dist(a[0], a[1], a[2], prrax::kCoarseRadius[ci],
                                        b[0], b[1], b[2], prrax::kCoarseRadius[cj]) > 0.0f)
                     continue;
@@ -632,12 +642,9 @@ __device__ __forceinline__ void prrtc_edge_cc_cooperative(
                     const int i = prrax::kSelfPairs[q * 2 + 0];
                     const int j = prrax::kSelfPairs[q * 2 + 1];
                     if (i < 0 || j < 0 || i >= prrax::n_spheres || j >= prrax::n_spheres) continue;
-                    const int lii = prrax::kSphereJoint[i];
-                    const int ljj = prrax::kSphereJoint[j];
-                    if (lii >= grim::robot::n_frames || ljj >= grim::robot::n_frames) continue;
                     float pi[3], pj[3];
-                    apply_se3_point(frame_tf(myT, lii), &prrax::kSphereLocal[i * 3], pi);
-                    apply_se3_point(frame_tf(myT, ljj), &prrax::kSphereLocal[j * 3], pj);
+                    prrax::fused_centre(myT, i, pi);
+                    prrax::fused_centre(myT, j, pj);
                     if (sphere_sphere_dist(pi[0], pi[1], pi[2], prrax::kSphereRadius[i],
                                            pj[0], pj[1], pj[2], prrax::kSphereRadius[j]) <= 0.0f) {
                         self_hit = true;
@@ -653,6 +660,20 @@ __device__ __forceinline__ void prrtc_edge_cc_cooperative(
         __syncwarp(group_mask);
     }
 }
+
+#ifdef PRRAX_EDGE_TRACED
+// Mode 4's cooperative scratch (warp / block tier): per block, the tier's tables, then its scratch
+// (one per warp for the warp tier). Global memory: the layouts overflow shared memory at these
+// sizes. Set by prrax_plan_raw; unused by the thread tier.
+__device__ float* prrax_edge_scratch_g;
+__device__ __forceinline__ int prrax_edge_units() { return PRRAX_EDGE_TIER == 1 ? (blockDim.x >> 5) : 1; }
+__device__ __forceinline__ size_t prrax_edge_stride() {
+    return (size_t)prrax::edge_tables + (size_t)prrax_edge_units() * prrax::edge_smem;
+}
+__device__ __forceinline__ float* prrax_edge_block_scratch() {
+    return PRRAX_EDGE_TIER == 0 ? nullptr : prrax_edge_scratch_g + blockIdx.x * prrax_edge_stride();
+}
+#endif
 
 // Main pRRTC planning kernel — aligned with pRRTC parallel semantics.
 //
@@ -727,10 +748,6 @@ __device__ void plan_problem(
     const CollisionContext& collision_ctx = ctx_sh;
 
     // --- Shared memory ---
-    // NN reduction arrays (one entry per thread in block; sized to max granularity)
-    __shared__ float sdata[PRRTC_BLOCK_THREADS_MAX];
-    __shared__ int   sindex_sh[PRRTC_BLOCK_THREADS_MAX];
-
     // Per-block Halton state (like pRRTC's per-block HaltonState)
     __shared__ int halton_st[CONFIG_DIM_MAX];
     __shared__ int prime_order[16];
@@ -759,7 +776,7 @@ __device__ void plan_problem(
     // Manifold constraints (prrtc_constraint.cuh): parameters, the projected waypoints of the
     // current edge, its start, and the connect target.
     __shared__ float cons_sh[PRRAX_CONS_SIZE];
-    __shared__ float wp_sh[PRRTC_BLOCK_THREADS_MAX * CONFIG_DIM_MAX];
+    __shared__ float wp_sh[PRRAX_W_MAX * CONFIG_DIM_MAX];
     __shared__ float near_sh[CONFIG_DIM_MAX];
     __shared__ float target_sh[CONFIG_DIM_MAX];
     __shared__ int   cflag_sh;
@@ -770,12 +787,12 @@ __device__ void plan_problem(
     for (int i = tid; i < PRRAX_CONS_SIZE; i += blockDim.x) cons_sh[i] = constraints[i];
 
     // Phase B cooperative-CC scratch: per-group shared FK transforms + shared edge endpoints.
-    __shared__ float cc_group_T[(PRRTC_BLOCK_THREADS_MAX / PRRTC_CC_LANES) * PRRTC_CC_MAX_JOINTS * 7];
+    __shared__ float cc_group_T[(PRRTC_BLOCK_THREADS_MAX / PRRTC_CC_LANES) * PRRAX_CC_X];
     __shared__ float cc_delta_sh[CONFIG_DIM_MAX];
     // Cooperative path is selected once: coarse model present, FK fits the shared buffer,
     // and the block is wide enough to form lane-groups. Uniform across the block.
     const bool cc_coop = (collision_ctx.collision_mode == 3 && prrax::coarse_enabled
-                          && grim::robot::n_frames <= PRRTC_CC_MAX_JOINTS
+                          && prrax::n_fused_frames <= PRRAX_CC_MAX_FRAMES
                           && static_cast<int>(blockDim.x) >= PRRTC_CC_LANES);
 
     // Initialize per-block Halton with shuffled primes.
@@ -801,8 +818,8 @@ __device__ void plan_problem(
     }
     __syncthreads();
     const bool constrained = cons_sh[CONS_N] > 0.0f;
-    // Two lanes per waypoint (PRRAX_WP_LANES): W = granularity waypoints per edge.
-    const int W = blockDim.x / PRRAX_WP_LANES;
+    // W = granularity waypoints per constrained edge (unconstrained: from the edge's length).
+    const int W = granularity;
     unsigned proj_calls = 0;   // per-block counter seeding the McVAMP steer perturbations
     const bool ao = best_cost < FLT_MAX;
 
@@ -823,22 +840,74 @@ __device__ void plan_problem(
         return sqrtf(best);
     };
 
-    // Collision check of the edge's W waypoints: base + (w+1)/W * delta, or the projected
-    // waypoints in wp_sh for a constrained edge. Collective; true if any waypoint collides.
+    // Collision check of an edge: unconstrained, n = ceil(|delta| * PRRAX_RESOLUTION) waypoints
+    // base + (w+1)/n * delta (VAMP/CRAB's resolution; the threads loop over them); constrained,
+    // the W projected waypoints in wp_sh with their gap sweeps. Collective; true if any collides.
     __shared__ int sweep_n_sh[32], sweep_off_sh[33];
+#ifdef PRRAX_EDGE_TRACED
+    __shared__ float edge_m_sh[PRRTC_BLOCK_THREADS_MAX];   // mode 4: one margin per waypoint slot
+#endif
     auto edge_in_collision = [&](const float* base, const float* delta) -> bool {
         // A solved problem needs no more checks: report the edge as blocked, so the block
         // falls through to its next stop check.
         if (tid == 0) any_collision_sh = atomicAdd(solved_out, 0) != 0;
         __syncthreads();
         if (any_collision_sh) return true;
+        int n_wp = W;
+        if (!constrained) {
+            float l2 = 0.f;
+            for (int d = 0; d < dim; ++d) l2 += delta[d] * delta[d];
+            n_wp = max(1, static_cast<int>(ceilf(sqrtf(l2) * PRRAX_RESOLUTION)));
+        }
+#ifdef PRRAX_EDGE_TRACED
+        if (!constrained && collision_ctx.collision_mode == 4) {
+            // Mode 4: the whole waypoint check traced by mantis (prrax::edge_margin, no early exit
+            // inside a waypoint). A round covers `per_round` waypoints; every thread joins every
+            // call (the cooperative tiers need the whole warp / block), past-the-end slots repeat
+            // the last waypoint and do not vote.
+#if PRRAX_EDGE_TIER == 0
+            const int per_round = blockDim.x, slot = tid;
+#elif PRRAX_EDGE_TIER == 1
+            const int per_round = (blockDim.x >> 5) * PRRAX_EDGE_P,
+                      slot = (tid >> 5) * PRRAX_EDGE_P + (tid & 31) / (32 / PRRAX_EDGE_P);
+#else
+            const int per_round = PRRAX_EDGE_P, slot = (tid & 31) / (32 / PRRAX_EDGE_P);
+#endif
+            float* eb = prrax_edge_block_scratch();
+            float* s = eb + prrax::edge_tables + (PRRAX_EDGE_TIER == 1 ? (tid >> 5) : 0) * prrax::edge_smem;
+            for (int k0 = 0; k0 < n_wp; k0 += per_round) {
+                const int k = min(k0 + slot, n_wp - 1);
+                prrax::edge_margin(base, delta, static_cast<float>(k + 1) / static_cast<float>(n_wp),
+                                   collision_ctx.world_spheres, collision_ctx.world_capsules,
+                                   collision_ctx.world_boxes, collision_ctx.world_halfspaces,
+                                   &edge_m_sh[slot], s, eb);
+                __syncthreads();   // the cooperative tiers end without a barrier
+                const bool bad = k0 + slot < n_wp && edge_m_sh[slot] <= 0.f;
+                if (__syncthreads_or(bad)) { if (tid == 0) any_collision_sh = 1; break; }
+            }
+        } else
+#endif
         if (cc_coop) {
-            prrtc_edge_cc_cooperative(base, delta, dim, W, collision_ctx, cc_group_T,
+            prrtc_edge_cc_cooperative(base, delta, dim, n_wp, collision_ctx, cc_group_T,
                                       &any_collision_sh, constrained ? wp_sh : nullptr,
                                       constrained ? cons_sh : nullptr, min_vals, max_vals);
+        } else if (!constrained) {
+            // PRRAX_WP_LANES threads per waypoint split its check; blockDim / lanes waypoints
+            // per round, stopping at the first round with a hit.
+            const int L = PRRAX_WP_LANES, total = n_wp * L;
+            float x[CONFIG_DIM_MAX];
+            for (int k0 = 0; k0 < total; k0 += blockDim.x) {
+                const int k = k0 + tid;
+                bool bad = false;
+                if (k < total) {
+                    edge_point(base, delta, static_cast<float>(k / L + 1) / static_cast<float>(n_wp), x);
+                    bad = prrtc_config_in_collision(x, collision_ctx, k % L, L);
+                }
+                if (__syncthreads_or(bad)) { if (tid == 0) any_collision_sh = 1; break; }
+            }
         } else {
             // VAMP's order, block-parallel. Round 0: the W waypoints (waypoint tid % W, lane
-            // tid / W checks its share of the pairs); any hit rejects the edge. Then the gap
+            // tid / W of blockDim / W checks its share of the pairs); any hit rejects the edge. Then the gap
             // sweep as a flat list of substeps over all gaps, PRRAX_SWEEP_LANES threads per
             // substep, one substep per thread group per round, stopping at the first failure.
             auto point = [&](int w, float* out) {   // waypoint w (-1: base)
@@ -846,10 +915,10 @@ __device__ void plan_problem(
                 if (constrained) { for (int d = 0; d < dim; ++d) out[d] = wp_sh[w * CONFIG_DIM_MAX + d]; return; }
                 edge_point(base, delta, static_cast<float>(w + 1) / static_cast<float>(W), out);
             };
-            const int slot = tid % W;
+            const int slot = tid % W, lanes = blockDim.x / W;
             float x[CONFIG_DIM_MAX], prev[CONFIG_DIM_MAX];
             point(slot, x);
-            bool bad = prrtc_config_in_collision(x, collision_ctx, tid / W);
+            bool bad = tid < W * lanes && prrtc_config_in_collision(x, collision_ctx, tid / W, lanes);
             if (tid < W) {
                 point(tid - 1, prev);
                 const float gap = sqrtf(prrax_cons::sq_dist(prev, x));
@@ -960,22 +1029,12 @@ __device__ void plan_problem(
                 local_min_sq2 = dsq; local_near2 = i;
             }
         }
-        sdata[tid]     = local_min_sq2;
-        sindex_sh[tid] = local_near2;
-        __syncthreads();
+        prrax_block_argmin(local_min_sq2, local_near2);
 
-        for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
-            if (tid < s && sdata[tid + s] < sdata[tid]) {
-                sdata[tid]     = sdata[tid + s];
-                sindex_sh[tid] = sindex_sh[tid + s];
-            }
-            __syncthreads();
-        }
-
-        if (sdata[0] == FLT_MAX) return false;   // AO-x: no node within the budget
+        if (local_min_sq2 == FLT_MAX) return false;   // AO-x: no node within the budget
         if (tid == 0) {
-            const float cd         = sqrtf(sdata[0]);
-            connect_nearest_idx_sh = sindex_sh[0];
+            const float cd         = sqrtf(local_min_sq2);
+            connect_nearest_idx_sh = local_near2;
             conn_g_sh = from_g;
             // n_extensions = ceil(dist / step_size); 0 means already touching (immediate connect)
             int n_ext = 0;
@@ -1012,7 +1071,7 @@ __device__ void plan_problem(
                 // connect is slower than a fresh sample (measured).
                 if (!prrax_cons::constrained_extend(cons_sh, curr_cfg_sh, target_sh, step_size,
                                                     min_vals, max_vals, wp_sh, &cflag_sh, bid,
-                                                    proj_calls++, solved_out) ||
+                                                    proj_calls++, solved_out, W) ||
                     prrax_cons::sq_dist(wp_sh + (W - 1) * CONFIG_DIM_MAX, target_sh) >= d_curr) {
                     extension_failed = true;
                     break;
@@ -1232,24 +1291,14 @@ __device__ void plan_problem(
                 local_min_sq = dsq; local_near = i;
             }
         }
-        sdata[tid]     = local_min_sq;
-        sindex_sh[tid] = local_near;
-        __syncthreads();
-
-        for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
-            if (tid < s && sdata[tid + s] < sdata[tid]) {
-                sdata[tid]     = sdata[tid + s];
-                sindex_sh[tid] = sindex_sh[tid + s];
-            }
-            __syncthreads();
-        }
+        prrax_block_argmin(local_min_sq, local_near);
 
         if (tid == 0) {
-            const float nd  = sqrtf(sdata[0]);
-            nearest_idx_sh  = sindex_sh[0];
+            const float nd  = sqrtf(local_min_sq);
+            nearest_idx_sh  = local_near;
             // Avoid over-pruning while trees are still tiny; otherwise one side can
             // stall at its root and appear as one-tree-only growth.
-            should_skip_sh  = sdata[0] == FLT_MAX || (dynamic_domain && __ldcg(&t_radii[nearest_idx_sh]) < nd);
+            should_skip_sh  = local_min_sq == FLT_MAX || (dynamic_domain && __ldcg(&t_radii[nearest_idx_sh]) < nd);
             if (!should_skip_sh) {
                 const float sc = (nd > 1e-8f) ? fminf(1.0f, step_size / nd) : 1.0f;
                 for (int d = 0; d < dim; ++d) {
@@ -1273,7 +1322,7 @@ __device__ void plan_problem(
         if (constrained) {
             edge_ok = prrax_cons::constrained_extend(cons_sh, near_sh, sample_sh, step_size,
                                                      min_vals, max_vals, wp_sh, &cflag_sh, bid,
-                                                     proj_calls++, solved_out);
+                                                     proj_calls++, solved_out, W);
             if (edge_ok && tid < dim) cfg_candidate_sh[tid] = wp_sh[(W - 1) * CONFIG_DIM_MAX + tid];
             __syncthreads();
         }
@@ -1427,6 +1476,12 @@ __global__ void prrax_plan_batch_kernel(
     float dd_alpha, float dd_radius, float dd_min_radius, int granularity)
 {
     __shared__ int p_sh;
+#ifdef PRRAX_EDGE_TRACED
+    if (collision_mode == 4 && PRRAX_EDGE_TIER != 0) {   // mode 4 cooperative tier: tables once per block
+        prrax::edge_load_tables(prrax_edge_block_scratch(), threadIdx.x, blockDim.x);
+        __syncthreads();
+    }
+#endif
     int p = blockIdx.x % L.batch;   // first assignment: spread evenly
     if (threadIdx.x == 0) atomicAdd(&L.active[p], 1);
     while (true) {
@@ -1521,20 +1576,21 @@ __global__ void prrax_shortcut_batch_kernel(
     const float* __restrict__ lo, const float* __restrict__ hi, int collision_mode,
     float collision_margin, float step_size, int phase, int max_path,
     float* __restrict__ seg_buf, int seg_max, int seg_blocks,   // seg_blocks: the largest grid
+    int granularity,                                            // W waypoints per connect step
     int* __restrict__ queue = nullptr)   // phase 2: (problem, edge) items pulled by any block
 {
     int p = blockIdx.x % L.batch;
     const int sub = blockIdx.x / L.batch, nb = gridDim.x / L.batch;
-    const int tid = threadIdx.x, dim = L.dim, W = blockDim.x / PRRAX_WP_LANES;
+    const int tid = threadIdx.x, dim = L.dim, W = granularity;
     constexpr int KM = PRRAX_SC_ANCHORS;
     __shared__ CollisionContext ctx_sh;
     __shared__ int zero_sh, cflag_sh, any_sh, nseg_sh, len_sh, go_sh;
     __shared__ float seglen_sh;
     __shared__ float mid_sh[CONFIG_DIM_MAX];
     __shared__ float cons_sh[PRRAX_CONS_SIZE];
-    __shared__ float wp_sh[PRRTC_BLOCK_THREADS_MAX * CONFIG_DIM_MAX];
+    __shared__ float wp_sh[PRRAX_W_MAX * CONFIG_DIM_MAX];
     __shared__ float cur_sh[CONFIG_DIM_MAX], tgt_sh[CONFIG_DIM_MAX];
-    __shared__ float cc_group_T[(PRRTC_BLOCK_THREADS_MAX / PRRTC_CC_LANES) * PRRTC_CC_MAX_JOINTS * 7];
+    __shared__ float cc_group_T[(PRRTC_BLOCK_THREADS_MAX / PRRTC_CC_LANES) * PRRAX_CC_X];
     float* S = seg_buf + (size_t)blockIdx.x * seg_max * dim;
     float *P, *Q, *lens;
     int *nsegs, *reach, *chain, *offs, *tail;   // tail: n_chain, q_len, fail
@@ -1578,7 +1634,7 @@ __global__ void prrax_shortcut_batch_kernel(
     if (!go_sh && !queued) return;   // block-uniform
     const CollisionContext& ctx = ctx_sh;
     const bool cc_coop = (collision_mode == 3 && prrax::coarse_enabled
-                          && grim::robot::n_frames <= PRRTC_CC_MAX_JOINTS
+                          && prrax::n_fused_frames <= PRRAX_CC_MAX_FRAMES
                           && static_cast<int>(blockDim.x) >= PRRTC_CC_LANES);
 
     auto dist = [&](const float* a, const float* b) {
@@ -1604,7 +1660,7 @@ __global__ void prrax_shortcut_batch_kernel(
             if (project) {
                 if (d_curr < eps * eps) { reached = true; break; }
                 if (!prrax_cons::constrained_extend(cons_sh, cur_sh, tgt_sh, step_size, lo, hi, wp_sh,
-                                                    &cflag_sh, p, seed * 64u + e, &zero_sh) ||
+                                                    &cflag_sh, p, seed * 64u + e, &zero_sh, W) ||
                     prrax_cons::sq_dist(wp_sh + (W - 1) * CONFIG_DIM_MAX, tgt_sh) >= d_curr) break;
             } else {
                 if (d_curr < 1e-12f) { reached = true; break; }
@@ -1628,9 +1684,10 @@ __global__ void prrax_shortcut_batch_kernel(
                 prrtc_edge_cc_cooperative(cur_sh, cur_sh, dim, W, ctx, cc_group_T, &any_sh, wp_sh,
                                           constrained ? cons_sh : nullptr, lo, hi);
             } else {
-                const int slot = tid % W;
+                const int slot = tid % W, lanes = blockDim.x / W;
                 const float* prev = slot == 0 ? cur_sh : wp_sh + (slot - 1) * CONFIG_DIM_MAX;
-                if (prrtc_gap_invalid(prev, wp_sh + slot * CONFIG_DIM_MAX, dim, ctx, tid / W,
+                if (tid < W * lanes &&
+                    prrtc_gap_invalid(prev, wp_sh + slot * CONFIG_DIM_MAX, dim, ctx, tid / W, lanes,
                                       constrained ? cons_sh : nullptr, lo, hi)) atomicOr(&any_sh, 1);
             }
             __syncthreads();
@@ -1872,6 +1929,7 @@ struct PrraxPlanSettings {
     int dynamic_domain; float dd_alpha, dd_radius, dd_min_radius;
     int max_nodes, granularity, collision_mode; float collision_margin; int shortcut_rounds;
     int batch, dim, num_goals; int mw[4];
+    int warps_per_problem;   // block = 32 * this threads (1, 2, 4); 0 (unset) = 1
 };
 
 // The planner on raw device pointers: setup, persistent planning, path tracing and (optionally)
@@ -1900,7 +1958,8 @@ static cudaError_t prrax_plan_raw(cudaStream_t stream, const float* inputs, cons
     const int max_path = B.max_path;
     if (!prrax_pool_cur) return cudaErrorInvalidValue;   // no PrraxScratchScope open
     PlannerPool& g_pool = *prrax_pool_cur;
-    cudaError_t e = g_pool.reserve(batch, (size_t)4 * batch * max_nodes, granularity * PRRAX_WP_LANES);
+    const int threads = 32 * std::max(1, S.warps_per_problem);
+    cudaError_t e = g_pool.reserve(batch, (size_t)4 * batch * max_nodes, threads);
     if (e != cudaSuccess) return e;
 
     BatchLayout L;
@@ -1923,7 +1982,20 @@ static cudaError_t prrax_plan_raw(cudaStream_t stream, const float* inputs, cons
     // A problem gets num_new_samples blocks while the batch is large; the grid never exceeds
     // what is resident at once (a persistent kernel must not wait on unscheduled blocks).
     const int grid = static_cast<int>(std::min<long long>((long long)batch * S.num_new_samples, g_pool.grid_cap));
-    prrax_plan_batch_kernel<<<grid, granularity * PRRAX_WP_LANES, 0, stream>>>(
+#ifdef PRRAX_EDGE_TRACED
+    if (collision_mode == 4) {
+        if (PRRAX_EDGE_TIER == 2 && threads != 32 * PRRAX_EDGE_K) return cudaErrorInvalidConfiguration;
+        if (PRRAX_EDGE_TIER != 0) {   // ponytail: fresh XLA scratch per call; pool it if this mode stays
+            const size_t units = PRRAX_EDGE_TIER == 1 ? threads / 32 : 1;
+            float* es = static_cast<float*>(prrax_scratch(sizeof(float) * grid *
+                                                          ((size_t)prrax::edge_tables + units * prrax::edge_smem)));
+            if (!es) return cudaErrorMemoryAllocation;
+            e = cudaMemcpyToSymbolAsync(prrax_edge_scratch_g, &es, sizeof(es), 0, cudaMemcpyHostToDevice, stream);
+            if (e != cudaSuccess) return e;
+        }
+    }
+#endif
+    prrax_plan_batch_kernel<<<grid, threads, 0, stream>>>(
         L, min_in, max_in, collision_mode, collision_margin,
         S.max_iterations, step_size, S.num_new_samples, S.balance_mode, S.tree_ratio, S.dynamic_domain,
         S.dd_alpha, S.dd_radius, S.dd_min_radius, granularity);
@@ -1940,9 +2012,9 @@ static cudaError_t prrax_plan_raw(cudaStream_t stream, const float* inputs, cons
         if (e != cudaSuccess) return e;
         auto launch = [&](int phase, int g) {
             if (phase == 2) cudaMemsetAsync(g_pool.queue, 0, sizeof(int), stream);
-            prrax_shortcut_batch_kernel<<<g, granularity * PRRAX_WP_LANES, 0, stream>>>(
+            prrax_shortcut_batch_kernel<<<g, threads, 0, stream>>>(
                 L, B.path, B.path_len, min_in, max_in, collision_mode,
-                collision_margin, step_size, phase, max_path, g_pool.seg, seg_max, grid,
+                collision_margin, step_size, phase, max_path, g_pool.seg, seg_max, grid, granularity,
                 phase == 2 ? g_pool.queue : nullptr);
         };
         // Shortcuts first (MR. POP smooths first): smoothing then only checks the few
@@ -1998,7 +2070,8 @@ static ffi::Error PrrtcPlannerImpl(
     int collision_mode,
     float collision_margin,
     int shortcut_rounds,
-    int batch, int dim, int num_goals, int mw0, int mw1, int mw2, int mw3
+    int batch, int dim, int num_goals, int mw0, int mw1, int mw2, int mw3,
+    int warps_per_problem
 ) {
     PrraxPlanBuffers B{tree_a_configs->typed_data(), tree_b_configs->typed_data(),
                        tree_a_parents->typed_data(), tree_b_parents->typed_data(),
@@ -2011,7 +2084,7 @@ static ffi::Error PrrtcPlannerImpl(
     PrraxPlanSettings S{max_iterations, step_size, num_new_samples, balance_mode, tree_ratio,
                         dynamic_domain, dd_alpha, dd_radius, dd_min_radius, max_nodes, granularity,
                         collision_mode, collision_margin, shortcut_rounds, batch, dim, num_goals,
-                        {mw0, mw1, mw2, mw3}};
+                        {mw0, mw1, mw2, mw3}, warps_per_problem};
     PrraxScratchScope scope(scratch);
     const cudaError_t e = prrax_plan_raw(stream, inputs.typed_data(), B, S);
     if (e != cudaSuccess) return ffi::Error(ffi::ErrorCode::kInternal, cudaGetErrorString(e));
@@ -2059,6 +2132,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Attr<int>("mw1")
         .Attr<int>("mw2")
         .Attr<int>("mw3")
+        .Attr<int>("warps_per_problem")
 );
 
 // Frame poses of this build's FK at configurations q [B, dim] -> T [B, n_frames, 7]. Checks a
@@ -2194,7 +2268,8 @@ __global__ void prrax_fill_int_kernel(int* x, int n, int v) {
 static cudaError_t prrax_simplify_raw(cudaStream_t stream, const float* inputs, float* path, int* path_len,
                                       int max_path, int rounds, float step_size, int granularity,
                                       int collision_mode, float collision_margin, int batch, int dim,
-                                      const int mw[4], int parts = 3) {   // parts: 1 shortcut, 2 smooth
+                                      const int mw[4], int parts = 3,     // parts: 1 shortcut, 2 smooth
+                                      int warps_per_problem = 1) {
     const float* in = inputs;
     const float* min_in = in;            in += dim;
     const float* max_in = in;            in += dim;
@@ -2206,7 +2281,8 @@ static cudaError_t prrax_simplify_raw(cudaStream_t stream, const float* inputs, 
     const float* cons_in = in;
     if (!prrax_pool_cur) return cudaErrorInvalidValue;   // no PrraxScratchScope open
     PlannerPool& g_pool = *prrax_pool_cur;
-    cudaError_t e = g_pool.reserve(batch, 1, granularity * PRRAX_WP_LANES);
+    const int threads = 32 * std::max(1, warps_per_problem);
+    cudaError_t e = g_pool.reserve(batch, 1, threads);
     if (e != cudaSuccess) return e;
     BatchLayout L{};
     L.solved = g_pool.ints;                              // every problem "solved"
@@ -2222,9 +2298,9 @@ static cudaError_t prrax_simplify_raw(cudaStream_t stream, const float* inputs, 
     if (e != cudaSuccess) return e;
     auto launch = [&](int phase, int g) {
         if (phase == 2) cudaMemsetAsync(g_pool.queue, 0, sizeof(int), stream);
-        prrax_shortcut_batch_kernel<<<g, granularity * PRRAX_WP_LANES, 0, stream>>>(
+        prrax_shortcut_batch_kernel<<<g, threads, 0, stream>>>(
             L, path, path_len, min_in, max_in, collision_mode, collision_margin, step_size, phase,
-            max_path, g_pool.seg, seg_max, grid, phase == 2 ? g_pool.queue : nullptr);
+            max_path, g_pool.seg, seg_max, grid, granularity, phase == 2 ? g_pool.queue : nullptr);
     };
     for (int r = 0; r < rounds; ++r) {
         if (parts & 1) {
@@ -2249,7 +2325,7 @@ static ffi::Error PrraxSimplifyImpl(
     ffi::Result<ffi::Buffer<ffi::DataType::F32>> path,
     ffi::Result<ffi::Buffer<ffi::DataType::S32>> path_len,
     int rounds, float step_size, int granularity, int collision_mode, float collision_margin,
-    int batch, int dim, int mw0, int mw1, int mw2, int mw3, int parts)
+    int batch, int dim, int mw0, int mw1, int mw2, int mw3, int parts, int warps_per_problem)
 {
     const int max_path = static_cast<int>(path->dimensions()[1]);
     cudaMemcpyAsync(path->typed_data(), path_in.typed_data(), sizeof(float) * (size_t)batch * max_path * dim,
@@ -2259,7 +2335,7 @@ static ffi::Error PrraxSimplifyImpl(
     PrraxScratchScope scope(scratch);
     const cudaError_t e = prrax_simplify_raw(stream, inputs.typed_data(), path->typed_data(), path_len->typed_data(),
                                              max_path, rounds, step_size, granularity, collision_mode,
-                                             collision_margin, batch, dim, mw, parts);
+                                             collision_margin, batch, dim, mw, parts, warps_per_problem);
     return e == cudaSuccess ? ffi::Error::Success() : ffi::Error(ffi::ErrorCode::kInternal, cudaGetErrorString(e));
 }
 
@@ -2285,4 +2361,5 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Attr<int>("mw2")
         .Attr<int>("mw3")
         .Attr<int>("parts")                      // 1 shortcut graph, 2 B-spline smoothing, 3 both
+        .Attr<int>("warps_per_problem")          // block = 32 * this threads
 );

@@ -154,6 +154,7 @@ def main() -> None:
     ap.add_argument("--num-new-samples", type=int, default=0,
                     help="blocks per problem (default: 256 single, 64 batched; both measured best)")
     ap.add_argument("--granularity", type=int, default=16)
+    ap.add_argument("--warps-per-problem", type=int, default=2, choices=[1, 2, 4])
     ap.add_argument("--max-nodes", type=int, default=200_000)
     ap.add_argument("--collision-checker", default="binary_coarse")
     ap.add_argument("--validate", action="store_true", help="independently check every path")
@@ -175,7 +176,7 @@ def main() -> None:
     kw = dict(max_iterations=args.max_iterations, step_size=step, num_new_samples=blocks,
               granularity=args.granularity, max_nodes=args.max_nodes, dynamic_domain=False,
               min_vals=lo, max_vals=hi, collision_checker=args.collision_checker,
-              projection=proj, jit_trace=True)
+              projection=proj, jit_trace=True, warps_per_problem=args.warps_per_problem)
 
     ctxs = [dict(base_ctx, world_boxes=p["boxes"]) for p in problems]
     cons = [[tsr_constraint(robot, p["tsr"])] for p in problems]

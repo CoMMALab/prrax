@@ -1,5 +1,5 @@
 """Unconstrained pRRTC on VAMP's bookshelf problem: single and batched solves are found and
-collision-free at their waypoints under pyroffi's own model.
+collision-free at their waypoints under pyroffi's own model, for 1, 2 and 4 warps per block.
 
     pytest tests/test_prrtc.py
 """
@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import jax.numpy as jnp
 import numpy as np
+import pytest
 from pyroffi.collision._obstacles import create_collision_environment
 
 import benchmark_constrained as B
@@ -15,7 +16,8 @@ from prrax.jax import prrtc_plan, prrtc_plan_batch
 from prrax.jax.utils import build_prrtc_collision_context, load_vamp_problem
 
 
-def test_prrtc() -> None:
+@pytest.mark.parametrize("warps", [1, 2, 4])
+def test_prrtc(warps: int) -> None:
     robot, coll = B.load_panda()
     problem = load_vamp_problem(B.PANDA.parent, problem="bookshelf_tall", index=1)
     obstacles = create_collision_environment(problem)
@@ -25,7 +27,7 @@ def test_prrtc() -> None:
     start = np.asarray(problem["start"], np.float32)
     goal = np.asarray(problem["goals"][0], np.float32)
     kw = dict(max_iterations=5000, step_size=0.5, num_new_samples=64, dynamic_domain=False,
-              min_vals=lo, max_vals=hi)
+              min_vals=lo, max_vals=hi, warps_per_problem=warps)
 
     def collision_free(path) -> bool:
         q = jnp.asarray(path, jnp.float32)
