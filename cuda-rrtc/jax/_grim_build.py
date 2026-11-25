@@ -33,7 +33,7 @@ _CONSTANT_BYTES = 48 * 1024
 # Robot-side keys of a collision context (see utils.build_prrtc_collision_context).
 ROBOT_KEYS = ("sphere_link_idx", "sphere_local", "sphere_radius", "self_pairs",
               "coarse_sphere_link_idx", "coarse_sphere_local", "coarse_sphere_radius",
-              "fine_link_offsets", "coarse_self_pairs", "self_pair_ranges")
+              "fine_link_offsets", "coarse_self_pairs", "self_pair_ranges", "sphere_world", "coarse_world")
 
 _cache: dict[str, tuple[str, ...]] = {}
 
@@ -68,6 +68,8 @@ def prrax_header(ctx, ee_joints: tuple[int, ...] = (), edge=None) -> str:
             + _table(space, "int", "kFineOffsets", t["fine_link_offsets"])
             + _table(space, "int", "kCoarseSelfPairs", t["coarse_self_pairs"])
             + _table(space, "int", "kSelfPairRanges", t["self_pair_ranges"])
+            + _table(space, "int", "kSphereWorld", t["sphere_world"])
+            + _table(space, "int", "kCoarseWorld", t["coarse_world"])
             + "}  // namespace prrax\n" + _traced_spheres(ctx, t, space, tuple(ee_joints), edge))
 
 

@@ -116,12 +116,14 @@ def world_obstacles_to_exact(obstacles) -> dict[str, np.ndarray]:
     }
 
 
-def build_prrtc_collision_context(robot, robot_coll, world_obstacles, attached_spheres=None):
+def build_prrtc_collision_context(robot, robot_coll, world_obstacles, attached_spheres=None, world_mask=None):
     """Build collision_context dict expected by cuda-rrtc/jax/prrtc.py.
 
     The robot and its sphere model select the planner build (baked into it); the world
     obstacles are per-call inputs. ``attached_spheres = (joint_frame, spheres [N, 4] xyz+r in
     that frame)`` adds a held object's spheres, checked against the world (not self).
+    ``world_mask`` ([n_fine] bool, valid fine spheres in link order, attached last; default all): spheres checked against
+    the world; the others only enter self-collision (e.g. static base spheres that touch the mounting surface).
     """
     sphere_local_full = np.asarray(robot_coll.coll.pose.translation(), dtype=np.float32)
     sphere_radius_full = np.asarray(robot_coll.coll.radius, dtype=np.float32)
@@ -143,6 +145,8 @@ def build_prrtc_collision_context(robot, robot_coll, world_obstacles, attached_s
         joint_per_sphere = np.concatenate((joint_per_sphere, np.full(len(att), frame, np.int32)))
         local_per_sphere = np.concatenate((local_per_sphere, att[:, :3]))
         radius_per_sphere = np.concatenate((radius_per_sphere, att[:, 3]))
+
+    world = np.ones(len(radius_per_sphere), bool) if world_mask is None else np.asarray(world_mask, bool)
 
     # --- Group fine spheres by FK frame and sort so each group is contiguous. ---
     # The CUDA planner can then gate the fine check on a per-group "dirty" flag set by a
@@ -166,6 +170,8 @@ def build_prrtc_collision_context(robot, robot_coll, world_obstacles, attached_s
         group_starts = np.zeros((0,), dtype=np.int64)
         group_ends = np.zeros((0,), dtype=np.int64)
 
+    sphere_world = world[order].astype(np.int32)
+    coarse_world = np.array([sphere_world[s:e].any() for s, e in zip(group_starts, group_ends)], np.int32)
     coarse_sphere_link_idx = sphere_link_idx[group_starts].astype(np.int32)
     fine_link_offsets = np.concatenate(
         (group_starts, [sphere_link_idx.shape[0]])
@@ -242,6 +248,8 @@ def build_prrtc_collision_context(robot, robot_coll, world_obstacles, attached_s
         "fine_link_offsets": fine_link_offsets,
         "coarse_self_pairs": coarse_self_pairs,
         "self_pair_ranges": self_pair_ranges,
+        "sphere_world": sphere_world,  # 0: self-collision only
+        "coarse_world": coarse_world,
         **world_geom,
     }
 

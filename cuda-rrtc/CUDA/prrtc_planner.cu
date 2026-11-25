@@ -259,6 +259,7 @@ __device__ __forceinline__ bool prrtc_config_in_collision_differentiable(
     float cost = 0.0f;
 
     for (int rs = 0; rs < prrax::n_spheres; ++rs) {
+        if (!prrax::kSphereWorld[rs]) continue;
         const int link_idx = prrax::kSphereJoint[rs];
         if (link_idx >= grim::robot::n_frames) continue;
 
@@ -375,6 +376,7 @@ __device__ __forceinline__ bool prrtc_config_in_collision_binary_coarse(
     // --- Coarse world pre-pass: flag groups that might collide. ---
     bool any_dirty = false;
     for (int k = first; k < n_coarse; k += stride) {
+        if (!prrax::kCoarseWorld[k]) continue;
         float wp[3];
         prrax::fused_coarse_centre(X, k, wp);
         if (prrtc_sphere_vs_world(ctx, wp[0], wp[1], wp[2], prrax::kCoarseRadius[k])) {
@@ -390,6 +392,7 @@ __device__ __forceinline__ bool prrtc_config_in_collision_binary_coarse(
             const int start = prrax::kFineOffsets[k];
             const int end   = prrax::kFineOffsets[k + 1];
             for (int rs = start; rs < end; ++rs) {
+                if (!prrax::kSphereWorld[rs]) continue;
                 float wp[3];
                 prrax::fused_centre(X, rs, wp);
                 if (prrtc_sphere_vs_world(ctx, wp[0], wp[1], wp[2], prrax::kSphereRadius[rs]))
@@ -443,6 +446,7 @@ __device__ __forceinline__ bool prrtc_fused_in_collision(const float* cfg, const
     prrax::fused_frames(cfg, X);
     for (int rs = first; rs < prrax::n_spheres; rs += stride) {
         if (check_aborted(ctx, rs)) return true;
+        if (!prrax::kSphereWorld[rs]) continue;  // self-collision only (e.g. static base spheres)
         float p[3];
         prrax::fused_centre(X, rs, p);
         if (prrtc_sphere_vs_world(ctx, p[0], p[1], p[2], prrax::kSphereRadius[rs])) return true;
@@ -598,6 +602,7 @@ __device__ __forceinline__ void prrtc_edge_cc_cooperative(
         // Coarse pre-pass: lanes split coarse spheres, build a per-group dirty bitmask.
         unsigned long long dirty = 0ull;
         for (int k = lane; k < prrax::n_coarse; k += PRRTC_CC_LANES) {
+            if (!prrax::kCoarseWorld[k]) continue;
             float wp[3];
             prrax::fused_coarse_centre(myT, k, wp);
             if (prrtc_sphere_vs_world(ctx, wp[0], wp[1], wp[2], prrax::kCoarseRadius[k]))
@@ -613,6 +618,7 @@ __device__ __forceinline__ void prrtc_edge_cc_cooperative(
             const int s = prrax::kFineOffsets[k];
             const int e = prrax::kFineOffsets[k + 1];
             for (int rs = s + lane; rs < e; rs += PRRTC_CC_LANES) {
+                if (!prrax::kSphereWorld[rs]) continue;
                 float wp[3];
                 prrax::fused_centre(myT, rs, wp);
                 if (prrtc_sphere_vs_world(ctx, wp[0], wp[1], wp[2], prrax::kSphereRadius[rs])) {
